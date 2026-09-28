@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+data/
+*.sqlite3*
+
+# Local credentials, runtime output, and editor/agent state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+*.pid
+*.db
+*.db-*
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
+.agents/
+.codex/
