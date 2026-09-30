@@ -12,6 +12,16 @@ EQUITY_MIGRATION=(
     '179cc76ed95032ca4a94abf0932f47ae98de86172f3db528b30bc23d255a7581',
     'fb24f0823dd7a0480443d218c91e3afab9a2fe947d11a1ad8b312d077a987f24')
 
+# Calls and all finite research values are unchanged. New snapshots add real
+# puts; overflowed relative disagreement becomes unavailable. The session
+# journals this exact-revision upgrade; historical observations stay immutable.
+INTERACTION_MIGRATION=(EQUITY_MIGRATION[1],
+    '1133d8d67863377be04f0c00edf36f1295577503d272d97599177ba3a2cd560e')
+# The intermediate interaction build was already collecting. Its committed
+# checkpoint is compatible; persistence failure state is deliberately transient.
+CHECKPOINT_GUARD_MIGRATION=(
+    '9233d3c792403e868d4936761cd2505a1b2398c017d5d6aca1c5f8252af5e695',INTERACTION_MIGRATION[1])
+
 
 def reducer_hash(directory):
     digest=hashlib.sha256()
@@ -36,9 +46,11 @@ def restore(engine):
                     checkpoint=candidate
                 elif (reducer_hash(archived),reducer_hash(Path(__file__).parent))==EQUITY_MIGRATION:
                     checkpoint=candidate;engine.restore_migration='equity-context-1'
+                elif (reducer_hash(archived),reducer_hash(Path(__file__).parent)) in (INTERACTION_MIGRATION,CHECKPOINT_GUARD_MIGRATION):
+                    checkpoint=candidate;engine.restore_migration='interaction-1'
         if checkpoint:
             engine.load_checkpoint(checkpoint['state'])
-            print(f'BASIS restored checkpoint at raw #{checkpoint["raw_id"]}; reducer source unchanged',flush=True)
+            print(f'BASIS restored checkpoint at raw #{checkpoint["raw_id"]}; '+getattr(engine,'restore_migration','reducer source unchanged'),flush=True)
         for record in engine.store.raw(after=checkpoint['raw_id'] if checkpoint else 0):
             engine.apply(record)
             if record['id'] % 25000 == 0:

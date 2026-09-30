@@ -37,7 +37,10 @@ def discrepancy(pm, opt):
     if p is None or q is None:
         return dict(gap_pp=None, relative_gap=None, side=None)
     gap = p - q
-    return dict(gap_pp=gap * 100, relative_gap=abs(gap) / q if q > 0 else None,
+    relative = abs(gap) / q if q > 0 else None
+    # Subnormal tail probabilities can overflow the ratio even with valid inputs.
+    # Keep the absolute gap; an unrepresentable REL is unavailable, never infinity.
+    return dict(gap_pp=gap * 100, relative_gap=relative if relative is not None and math.isfinite(relative) else None,
                 side='CHEAP' if gap > 0 else 'RICH' if gap < 0 else 'EVEN')
 
 

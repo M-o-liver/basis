@@ -20,6 +20,12 @@ def session_close(date):
     return int(cal.session_close(date).timestamp()*1000) if cal.is_session(date) else None
 
 
+def regular_session(now):
+    cal=calendar();day=datetime.fromtimestamp(now/1000,NY).date().isoformat()
+    is_open=cal.is_session(day) and cal.session_open(day).timestamp()*1000<=now<cal.session_close(day).timestamp()*1000
+    return dict(market_state='OPEN' if is_open else 'CLOSED')
+
+
 def snapshot(asset,cutoffs,starts,offset_hours,now=None):
     import exchange_calendars
     import yfinance as yf
@@ -33,8 +39,7 @@ def snapshot(asset,cutoffs,starts,offset_hours,now=None):
     source_ms=timestamp(metadata.get('regularMarketTime'))
     if spot is None:spot=number(daily['Close'].iloc[-1])
     if source_ms is None:source_ms=int(daily.index[-1].timestamp()*1000)
-    session=cal.is_session(today)
-    is_open=session and cal.session_open(today).timestamp()*1000<=now<cal.session_close(today).timestamp()*1000
+    is_open=regular_session(now)['market_state']=='OPEN'
     candles=[]
     for index,row in daily.iterrows():
         day=index.date().isoformat()

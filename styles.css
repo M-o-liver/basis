@@ -80,3 +80,4 @@ pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0}#statu
 #table[data-view="wallets"] td:last-child{max-width:300px;overflow:hidden;text-overflow:ellipsis}
 .workspace:has(#table[data-view="wallets"]){min-height:295px}
 @media(max-height:750px){#equity-svg{height:120px}}
+.view-message{white-space:normal;padding:10px 8px}#trade-context{white-space:pre-line}#trade-message{margin:8px 0}#trade-exclusions,#trade-quote{color:#aaa}.modal-actions{flex-wrap:wrap}
