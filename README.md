@@ -141,6 +141,14 @@ Tests cover conversions, sign/REL, finite values, semantics, timestamps, provena
 
 Press **8 Wallets**, **9 Positions**, **0 Ledger**, or **T Paper ticket**. OLIVER and seven reserved analyzer wallets each start at $100,000. Only OLIVER accepts manual orders. Analyzer wallets run separate versioned experimental policies; analyzers themselves do not place orders.
 
+Select a current event in Monitor, Markets, Tape, Gaps or Algos before pressing **T**. The ticket freezes that event's context, lists actual nearby calls and puts, previews costs, and stays open until the order fills, rejects or cancels. Final fills show the quote, costs, cash and position; rejections show the backend reason. Closing a pending ticket does not cancel it; **T** reopens it. Unknown explicit event IDs fail instead of choosing another underlying.
+
+Yahoo paper quotes are explicitly delayed/proxy/estimated. They require an OPEN regular session and a BASIS receipt within two configured collection cycles (120 seconds at the default 60-second cadence, with a 45-second minimum). The underlying source timestamp is preserved; an unknown option-book timestamp stays unknown. Crypto quotes retain the strict 45-second source/receipt limit. Instrument discovery returns compact exclusion reasons alongside executable rows.
+
+Each tab reports loading, data, empty with a reason, or error with a reason. Tape/Gaps/Algos retain selected-event scope and offer **Show all events** when global records exist. Secondary request failures do not change the service connection indicator or stop monitor polling. Wallet run selectors expose retained positions and ledger entries; selecting an archived chart defaults to its full run. See [the interaction acceptance record](docs/interaction-acceptance-2026-09-30.md) for exercised paths and limits.
+
+API additions: `/api/instruments` returns `rows`, `event`, `asset`, and summarized `exclusions`; `/api/order?order_id=...` returns the ledger-backed asynchronous order status. Wallet/positions/history requests accept `wallet` and `run_id`. Browser ledger requests omit periodic marks, while CLI history retains them.
+
 ```sh
 ./basis wallets
 ./basis instruments ETH

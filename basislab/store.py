@@ -66,7 +66,10 @@ class Store:
                 yield
                 self.db.execute('COMMIT')
             except BaseException:
-                self.db.execute('ROLLBACK')
+                # SQLite may already abort a transaction (e.g. SQLITE_FULL).
+                # Preserve that useful failure instead of masking it in cleanup.
+                if self.db.in_transaction:
+                    self.db.execute('ROLLBACK')
                 raise
 
     def append_raw(self, source, kind, subject, payload, session, received_ms=None, source_ms=None, monotonic_ns=None):
@@ -139,12 +142,19 @@ class Store:
             rows = self.db.execute(f'SELECT id,data FROM observations WHERE (? IS NULL OR event_id=?) AND timestamp_ms BETWEEN ? AND ? AND id>? AND id<? ORDER BY id {order} LIMIT ?', (event_id, event_id, start, end, after_id, before_id, max(0,min(limit,10000)))).fetchall()
         return [dict(decode(row['data']), observation_id=row['id']) for row in (reversed(rows) if tail else rows)]
 
-    def latest(self, table, key, limit=200):
+    def latest(self, table, key, limit=200, event_id=None):
         if (table, key) not in {('episodes', 'gap_event_id'), ('analyzers', 'scope,algo_name'), ('observations', 'event_id')}:
             raise ValueError('Unsupported table')
         with self.lock:
-            rows = self.db.execute(f'SELECT id,data FROM {table} WHERE id IN (SELECT MAX(id) FROM {table} GROUP BY {key}) ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+            field='scope' if table=='analyzers' else 'event_id'
+            rows = self.db.execute(f'SELECT id,data FROM {table} WHERE id IN (SELECT MAX(id) FROM {table} GROUP BY {key}) AND (? IS NULL OR {field}=?) ORDER BY id DESC LIMIT ?', (event_id,event_id,limit)).fetchall()
         return [dict(decode(row['data']), record_id=row['id']) for row in rows]
+
+    def research_count(self,view):
+        with self.lock:
+            if view=='replay':return self.db.execute('SELECT COALESCE(MAX(id),0) FROM observations').fetchone()[0]
+            table,key={'episodes':('episodes','gap_event_id'),'algos':('analyzers','scope,algo_name')}[view]
+            return self.db.execute(f'SELECT COUNT(*) FROM (SELECT 1 FROM {table} GROUP BY {key})').fetchone()[0]
 
     def stats(self):
         with self.lock:

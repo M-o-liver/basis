@@ -15,7 +15,7 @@ from .policies import ALGOS, PolicyRunner, definition
 from .performance import PerformanceReview
 
 WALLETS=('OLIVER','SW','EVENT_SYNC','LEAD_LAG','COVARIANCE','TOPOLOGY','ORDINAL_MMD','MARTINGALE')
-VERSION='paper-1.2.0'
+VERSION='paper-1.3.0'
 
 @dataclass(frozen=True)
 class PaperConfig:
@@ -45,6 +45,12 @@ def finite(value):
         x=float(value)
         return x if math.isfinite(x) else None
     except (ValueError,TypeError): return None
+
+
+class QuoteUnavailable(ValueError):
+    def __init__(self,code,reason):
+        self.code=code
+        super().__init__(reason)
 
 
 class PaperDesk:
@@ -171,9 +177,11 @@ class PaperDesk:
     def quote(self,instrument,now=None):
         now=self.clock() if now is None else now
         with self.engine.lock:
+            if getattr(self.engine,'persistence_error',None):
+                raise QuoteUnavailable('RECORDER_FAILED','Recorder persistence failed; paper execution unavailable: '+self.engine.persistence_error)
             if instrument.startswith('SPOT:'):
                 asset=instrument[5:];spot=self.engine.spots.get(asset)
-                if not spot:raise ValueError('No spot quote for '+asset)
+                if not spot:raise QuoteUnavailable('NO_SPOT','No spot quote for '+asset)
                 raw=self.engine.store.raw_record(spot['raw_id']);p=raw['payload']
                 bid,ask=finite(p.get('best_bid')),finite(p.get('best_ask'))
                 estimated=bid is None or ask is None
@@ -183,6 +191,7 @@ class PaperDesk:
                 q=dict(instrument=instrument,asset=asset,kind='spot',venue=spot['venue'],bid=bid,ask=ask,
                     multiplier=1,received_ms=spot['received_ms'],source_ms=spot['source_ms'],raw_id=spot['raw_id'],
                     estimated=estimated,quote_assumption='Estimated spread' if estimated else 'Quoted bid/ask',expiry=None,
+                    market_state=spot.get('context',{}).get('market_state'),
                     settlement_model='USD cash; unlevered spot',fractional=asset in ('BTC','ETH'))
             else:
                 match=None
@@ -207,38 +216,85 @@ class PaperDesk:
                             bid,ask=finite(put.get('bid_price')),finite(put.get('ask_price'))
                             match=(surface,dict(instrument=instrument,strike=anchor['strike'],option_type='put',bid=bid*forward if bid is not None else None,ask=ask*forward if ask is not None else None,iv=finite(put.get('mark_iv'))/100 if finite(put.get('mark_iv')) is not None else None))
                         break
-                if match is None:raise ValueError('Instrument is absent from current surfaces')
+                if match is None:raise QuoteUnavailable('NO_SURFACE','Instrument is absent from current surfaces')
                 surface,call=match
                 asset=next(a for (a,e),s in self.engine.surfaces.items() if s is surface)
                 bid,ask=finite(call.get('bid')),finite(call.get('ask'))
-                if bid is None or ask is None:raise ValueError('Option execution requires both bid and ask')
+                if bid is None or ask is None:raise QuoteUnavailable('MISSING_BID_ASK','Option execution requires both bid and ask')
                 q=dict(instrument=instrument,asset=asset,kind='option',venue=surface['venue'],bid=bid,ask=ask,
                     multiplier=100 if surface['venue']=='yahoo' else 1,strike=call['strike'],option_type=call.get('option_type','call'),
                     iv=call.get('iv'),
                     expiry=surface['expiry'],received_ms=surface['received_ms'],source_ms=surface['source_ms'],raw_id=surface['raw_id'],market_state=surface.get('context',{}).get('market_state'),
                     estimated=surface['venue']=='yahoo',quote_assumption='Yahoo delay unknown' if surface['venue']=='yahoo' else 'Coin premium converted to USD at reported forward',
                     settlement_model='USD cash-equivalent; physical exercise and coin collateral not simulated; explicit settlement required',fractional=False)
-            if bid<0 or ask<=0 or bid>ask:raise ValueError('Invalid or crossed executable quote')
-            if not 0<=now-q['received_ms']<=self.config.quote_max_age_ms or not 0<=now-q['source_ms']<=self.config.quote_max_age_ms:
-                raise ValueError('Quote stale or not yet available')
-            if q['expiry'] and now>=q['expiry']:raise ValueError('Expired option: explicit settlement required')
-            if q.get('market_state')=='CLOSED':raise ValueError('Stock regular session is closed; quote is for research only')
+            if q['expiry'] and now>=q['expiry']:raise QuoteUnavailable('EXPIRED','Expired option: explicit settlement required')
+            if q['venue']=='yahoo':
+                from .equities import regular_session
+                if q.get('market_state')=='CLOSED' or regular_session(now)['market_state']=='CLOSED':
+                    raise QuoteUnavailable('MARKET_CLOSED','Yahoo regular session is closed; stock paper execution unavailable')
+                if q.get('market_state')!='OPEN':
+                    raise QuoteUnavailable('SESSION_UNKNOWN','Yahoo regular-session state is unknown')
+                # Yahoo books have no trustworthy exchange timestamp. Receipt
+                # freshness is a distinct, explicitly estimated execution model.
+                limit=max(self.config.quote_max_age_ms,self.engine.config.yahoo_seconds*2000)
+                q.update(estimated=True,quote_delay='unknown',freshness_basis='BASIS_RECEIPT',receipt_max_age_ms=limit,
+                    underlying_source_ms=self.engine.spots.get(q['asset'],{}).get('source_ms'),
+                    quote_assumption='Yahoo delayed/proxy/estimated; '+('option book timestamp unknown; ' if q['kind']=='option' else '')+'receipt freshness only')
+                if q['kind']=='option':q['source_ms']=call.get('source_ms')
+                if q['source_ms'] is not None and q['source_ms']>now:
+                    raise QuoteUnavailable('QUOTE_STALE','Yahoo source timestamp is not yet available')
+            else:
+                limit=self.config.quote_max_age_ms
+                q.update(freshness_basis='SOURCE_AND_RECEIPT',receipt_max_age_ms=limit)
+                if q['source_ms'] is None or not 0<=now-q['source_ms']<=limit:
+                    raise QuoteUnavailable('QUOTE_STALE','Quote source timestamp is stale or not yet available')
+            if not 0<=now-q['received_ms']<=limit:
+                raise QuoteUnavailable('QUOTE_STALE',f'Quote retrieval is stale or not yet available (limit {limit//1000}s)')
+            if bid<0 or ask<=0 or bid>ask:raise QuoteUnavailable('MISSING_BID_ASK','Invalid, missing or crossed executable bid/ask')
             q['quoted_at']=now
             return q
 
+    def event_context(self,event_id):
+        with self.engine.lock:
+            event=self.engine.events.get(str(event_id))
+            if event is None:
+                raise QuoteUnavailable('UNKNOWN_EVENT',f'Unknown or inactive event {event_id!r}; select a current market event')
+            return dict(event,**self.engine.latest.get(str(event_id),{}))
+
     def instruments(self,event_id=None,asset=None):
         with self.engine.lock:
-            event=self.engine.events.get(event_id,{})
-            asset=asset or event.get('asset') or 'ETH'
+            event=self.event_context(event_id) if event_id is not None else {}
+            if asset and event and asset.upper()!=event.get('asset'):
+                raise QuoteUnavailable('EVENT_ASSET_MISMATCH','Explicit asset does not match the selected event')
+            asset=event.get('asset') if event else str(asset or '').strip().upper()
+            if not asset:raise QuoteUnavailable('UNSUPPORTED_EVENT','Select a supported event or provide an explicit asset')
+            exclusions={}
+            def exclude(code,reason,instrument=None):
+                item=exclusions.setdefault(code,dict(code=code,reason=reason,count=0,examples=[]))
+                item['count']+=1
+                if instrument and len(item['examples'])<3:item['examples'].append(instrument)
+            if event and event.get('event_type') not in ('touch','terminal'):
+                return dict(rows=[],event=event,asset=asset,exclusions=[dict(code='UNSUPPORTED_EVENT',reason='Unsupported event mapping',count=1,examples=[])])
+            if event and event['expiry']<=self.clock():
+                return dict(rows=[],event=event,asset=asset,exclusions=[dict(code='EXPIRED',reason='Selected event has expired; select a current event',count=1,examples=[])])
             strike=event.get('strike_or_threshold') or self.engine.spots.get(asset,{}).get('price',0)
             cutoff=event.get('expiry',self.clock())
-            surfaces=sorted((s for (a,e),s in self.engine.surfaces.items() if a==asset and e>=cutoff),key=lambda s:s['expiry'])[:2]
-            ids=['SPOT:'+asset]+[c['instrument'] for s in surfaces for c in sorted(s['calls']+s.get('puts',[]),key=lambda c:abs(c['strike']-strike))[:24]]
+            available=[s for (a,e),s in self.engine.surfaces.items() if a==asset]
+            surfaces=sorted((s for s in available if s['expiry']>=cutoff),key=lambda s:s['expiry'])[:2]
+            if not available:exclude('NO_SURFACE','No option surface has been collected for '+asset)
+            elif not surfaces:exclude('NO_CHAIN_AFTER_EVENT_CUTOFF','No option chain expires at or after the selected event cutoff')
+            ids=['SPOT:'+asset]
+            # A separate nearby quota for each right prevents calls crowding out puts.
+            for s in surfaces:
+                for right in ('calls','puts'):
+                    contracts=s.get(right,[])
+                    if not contracts:exclude('MISSING_RIGHT','No '+right+' in the current option snapshot')
+                    ids.extend(c['instrument'] for c in sorted(contracts,key=lambda c:abs(c['strike']-strike))[:12])
         rows=[]
         for instrument in ids:
             try:rows.append(self.quote(instrument))
-            except ValueError:pass
-        return rows
+            except ValueError as error:exclude(getattr(error,'code','QUOTE_UNAVAILABLE'),str(error),instrument)
+        return dict(rows=rows,event=event or None,asset=asset,exclusions=list(exclusions.values()),as_of=self.clock())
 
     def policy_instrument(self,row,direction,parameters,budget=None):
         with self.engine.lock:
@@ -271,25 +327,38 @@ class PaperDesk:
         fill=max(0,price+slip if side=='BUY' else price-slip)
         gross=fill*quantity*quote['multiplier']
         fees=gross*self.config.fee_bps/10000+(quantity*self.config.fee_per_contract if quote['kind']=='option' else 0)
-        return dict(quoted_bid=quote['bid'],quoted_ask=quote['ask'],quote_price=price,fill_price=fill,slippage_per_unit=abs(fill-price),
+        return dict(quoted_bid=quote['bid'],quoted_ask=quote['ask'],quote_price=price,fill_price=fill,
+            spread=(quote['ask']-quote['bid'])/2*quantity*quote['multiplier'],slippage_per_unit=abs(fill-price),
             slippage=abs(fill-price)*quantity*quote['multiplier'],gross_premium=gross,fees=fees,
             total_debit=gross+fees if side=='BUY' else None,net_credit=gross-fees if side=='SELL' else None,
             assumptions='Configured fee/slippage/size model; depth impact estimated',depth_available=False)
 
-    def metrics(self,wallet):
-        state=self.states[wallet];positions=[];market_value=0.;unrealized=0.;stale=0
+    def resolve_run(self,wallet,run_id=None):
+        if wallet not in self.runs:raise ValueError('Unknown wallet '+str(wallet))
+        if run_id is None or int(run_id)==self.runs[wallet]['id']:return self.runs[wallet],self.states[wallet],False
+        row=self.db.execute('SELECT * FROM runs WHERE id=? AND wallet=?',(run_id,wallet)).fetchone()
+        if row is None:raise ValueError('Run does not belong to the selected wallet')
+        latest=self.db.execute('SELECT data FROM ledger WHERE run_id=? ORDER BY id DESC LIMIT 1',(run_id,)).fetchone()
+        return dict(json.loads(row['data']),id=row['id']),json.loads(latest['data'])['state_after'],True
+
+    def metrics(self,wallet,run_id=None):
+        run,state,archived=self.resolve_run(wallet,run_id)
+        positions=[];market_value=0.;unrealized=0.;stale=0
         for instrument,p in state['positions'].items():
-            try:q=self.quote(instrument);bid=q['bid'];status='QUOTED'
+            try:
+                if archived:raise ValueError('ARCHIVED: last recorded bid, not a current quote')
+                q=self.quote(instrument);bid=q['bid'];status='QUOTED'
             except ValueError as error:
                 bid=p['last_bid'];q=None;status=str(error);stale+=1
             value=p['quantity']*p['multiplier']*bid;market_value+=value;unrealized+=value-p['cost_basis']
             positions.append(dict(p,instrument=instrument,market_value=value,unrealized_pnl=value-p['cost_basis'],mark_status=status,mark_raw_id=q['raw_id'] if q else p.get('mark_raw_id')))
         equity=state['cash']+market_value;peak=max(state['peak_equity'],equity)
-        run=self.runs[wallet];starting=run['starting_balance'];account_start=run.get('account_starting_balance',starting)
+        starting=run['starting_balance'];account_start=run.get('account_starting_balance',starting)
         account_peak=max(run.get('account_peak_equity',peak),peak)
-        policy_state=self.runs[wallet]['policy_state']
-        if wallet in ALGOS and self.auto_policies:policy_state=('AUTO: '+state.get('policy_status','Watching')) if state.get('automation_enabled',True) else 'PAUSED'
-        return dict(wallet_id=wallet,run_id=self.runs[wallet]['id'],run_number=self.runs[wallet]['run_number'],policy_state=policy_state,
+        policy_state=run['policy_state']
+        if archived:policy_state='ARCHIVED: retained ledger state'
+        elif wallet in ALGOS and self.auto_policies:policy_state=('AUTO: '+state.get('policy_status','Watching')) if state.get('automation_enabled',True) else 'PAUSED'
+        return dict(wallet_id=wallet,run_id=run['id'],run_number=run['run_number'],policy_state=policy_state,archived=archived,
             starting_balance=starting,cash=state['cash'],market_value=market_value,equity=equity,
             gross_exposure=market_value,net_exposure=market_value,realized_pnl=state['realized_pnl'],unrealized_pnl=unrealized,
             total_pnl=equity-starting,return_pct=(equity/starting-1)*100 if starting>0 else None,
@@ -308,7 +377,7 @@ class PaperDesk:
             average_loser=-state['gross_loss']/(state['closed_positions']-state['winners']) if state['closed_positions']>state['winners'] else None,
             turnover=state['turnover'],capital_utilization=market_value/equity if equity>0 else None,
             stale_marks=stale,bankrupt=state['dead'] or equity<=0,positions=positions,
-            pending_orders=[o for o in self.pending.values() if o['wallet_id']==wallet])
+            pending_orders=[] if archived else [o for o in self.pending.values() if o['wallet_id']==wallet])
 
     def risk(self,wallet,side,quantity,quote,cost):
         state=self.states[wallet];m=self.metrics(wallet);position=state['positions'].get(quote['instrument'])
@@ -331,10 +400,12 @@ class PaperDesk:
         if wallet not in self.runs or side not in ('BUY','SELL'):raise ValueError('Unknown wallet or side')
         if wallet!='OLIVER' and not policy:raise ValueError('Analyzer wallet orders are owned by their versioned policy')
         if quantity is None or not 0<quantity<=self.config.max_quantity:raise ValueError('Invalid quantity or contract limit exceeded')
+        context=self.event_context(payload['basis_event_id']) if payload.get('basis_event_id') is not None else None
         quote=self.quote(str(payload.get('instrument','')))
+        if context and context['asset']!=quote['asset']:raise ValueError('Instrument asset does not match the selected event')
         if not quote['fractional'] and not quantity.is_integer():raise ValueError('Whole shares/contracts required')
         costs=self.costs(quote,side,quantity);self.risk(wallet,side,quantity,quote,costs)
-        return dict(wallet_id=wallet,side=side,quantity=quantity,quote=quote,costs=costs,paper_only=True,latency_ms=self.config.latency_ms)
+        return dict(wallet_id=wallet,side=side,quantity=quantity,quote=quote,costs=costs,event=context,paper_only=True,latency_ms=self.config.latency_ms)
 
     def submit(self,payload,policy=False):
         with self.lock:
@@ -427,14 +498,31 @@ class PaperDesk:
             return self.append(wallet,'SETTLE',dict(instrument=instrument,reference_raw_id=raw['id'],reference_spot=price,payout=gross,realized_pnl=pnl,
                 assumption='Explicit USD cash-equivalent proxy; not exchange settlement verification',reason=payload['reason']),state)
 
-    def history(self,wallet='OLIVER',run_id=None,limit=100):
+    def order_status(self,order_id):
         with self.lock:
-            run_id=run_id or self.runs[wallet]['id']
-            return [dict(json.loads(r['data']),ledger_id=r['id'],timestamp=r['timestamp_ms']) for r in self.db.execute('SELECT * FROM ledger WHERE run_id=? ORDER BY id DESC LIMIT ?',(run_id,min(1000,max(1,int(limit)))))]
+            row=self.db.execute('SELECT * FROM ledger WHERE order_id=? ORDER BY id DESC LIMIT 1',(order_id,)).fetchone()
+            if row is None:return None
+            data=json.loads(row['data']);order=data['order']
+            return dict(order_id=order_id,status={'ORDER':'PENDING','FILL':'FILLED','REJECT':'REJECTED','CANCEL':'CANCELLED'}[row['kind']],
+                ledger_id=row['id'],timestamp=row['timestamp_ms'],wallet_id=order['wallet_id'],run_id=order['run_id'],
+                order=order,quote=data.get('quote'),fill=data.get('fill'),reason=data.get('reason'),
+                cash_after=data['state_after']['cash'],position_after=data['state_after']['positions'].get(order['instrument']),
+                execution_error=self.failure)
 
-    def snapshot(self):
+    def wallet_runs(self,wallet):
+        if wallet not in self.runs:raise ValueError('Unknown wallet '+str(wallet))
+        return [dict(json.loads(r['data']),id=r['id']) for r in self.db.execute('SELECT * FROM runs WHERE wallet=? ORDER BY id DESC',(wallet,))]
+
+    def history(self,wallet='OLIVER',run_id=None,limit=100,activity_only=False):
         with self.lock:
-            return dict(rows=sorted((self.metrics(w) for w in WALLETS),key=lambda m:-m['equity']),runs=[dict(json.loads(r['data']),id=r['id']) for r in self.db.execute('SELECT * FROM runs ORDER BY id DESC LIMIT 100')],
+            run,_,_=self.resolve_run(wallet,run_id)
+            clause=" AND kind IN ('ORDER','FILL','REJECT','CANCEL','SETTLE','CONTROL','CLOSE_RUN')" if activity_only else ''
+            return [dict(json.loads(r['data']),ledger_id=r['id'],timestamp=r['timestamp_ms']) for r in self.db.execute('SELECT * FROM ledger WHERE run_id=?'+clause+' ORDER BY id DESC LIMIT ?',(run['id'],min(1000,max(1,int(limit)))))]
+
+    def snapshot(self,wallet=None,run_id=None):
+        with self.lock:
+            if run_id is not None and wallet is None:raise ValueError('Select a wallet for a historical run')
+            return dict(rows=sorted((self.metrics(w,run_id) for w in ([wallet] if wallet else WALLETS)),key=lambda m:-m['equity']),runs=[dict(json.loads(r['data']),id=r['id']) for r in self.db.execute('SELECT * FROM runs ORDER BY id DESC')],
                 parameters=asdict(self.config),engine_version=VERSION,paper_only=True,failure=self.failure,
                 automation_enabled=any(self.states[w].get('automation_enabled',True) for w in ALGOS) and self.auto_policies,
                 policies={w:definition(w) for w in ALGOS},

@@ -5,7 +5,7 @@ from basislab.equities import calendar, session_close
 from basislab.semantics import infer_event, timestamp
 from basislab.store import Store
 from basislab.thesis import underlying_thesis, expression_thesis
-from basislab.replay import EQUITY_MIGRATION, reducer_hash
+from basislab.replay import EQUITY_MIGRATION, INTERACTION_MIGRATION, reducer_hash
 
 NOW=timestamp('2026-09-28T18:00:00Z')
 
@@ -50,7 +50,8 @@ class EquityThesisTests(unittest.TestCase):
         self.assertNotIn('AAPL',e.spots);self.assertIn('BTC',e.spots)
         raw=s.raw_record(e.last_raw_id)
         self.assertEqual(raw['payload']['checkpoint_migration'],'equity-context-1')
-        self.assertEqual(reducer_hash('basislab'),EQUITY_MIGRATION[1]);s.close()
+        self.assertEqual(INTERACTION_MIGRATION[0],EQUITY_MIGRATION[1])
+        self.assertEqual(reducer_hash('basislab'),INTERACTION_MIGRATION[1]);s.close()
 
     def test_underlying_opposes_bearish_alarm(self):
         row=dict(event_id='m',asset='BTC',spot=110,strike_or_threshold=120,event_type='touch',direction='up',

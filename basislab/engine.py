@@ -4,6 +4,7 @@ from dataclasses import asdict
 import hashlib
 import json
 import logging
+import sqlite3
 from pathlib import Path
 import threading
 import time
@@ -41,6 +42,7 @@ class Engine:
         self.observation_count = 0
         self.started_ms = time.time_ns() // 1_000_000
         self.restoring = False
+        self.persistence_error = None
 
     def start_session(self):
         if self.store.path != ':memory:':
@@ -52,6 +54,8 @@ class Engine:
                     target.write_bytes(path.read_bytes())
         extra={}
         if getattr(self,'restore_migration',None):
+            extra['checkpoint_migration']=self.restore_migration
+        if getattr(self,'restore_migration',None)=='equity-context-1':
             corrected=[];cache={}
             for event in self.catalog.values():
                 if event.get('asset') in (None,'BTC','ETH'):continue
@@ -68,10 +72,17 @@ class Engine:
             code_hash=self.code_hash, calculation_version=CALCULATION_VERSION, feature_version=FEATURE_VERSION,**extra))
 
     def ingest(self, source, kind, subject, payload, received_ms=None, source_ms=None, monotonic_ns=None):
-        with self.lock, self.store.transaction():
-            record = self.store.append_raw(source, kind, subject, payload, self.session, received_ms, source_ms, monotonic_ns)
-            self.apply(record)
-            return record['id']
+        with self.lock:
+            if self.persistence_error:
+                raise RuntimeError('Recorder persistence failed; restart from committed tape: '+self.persistence_error)
+            try:
+                with self.store.transaction():
+                    record = self.store.append_raw(source, kind, subject, payload, self.session, received_ms, source_ms, monotonic_ns)
+                    self.apply(record)
+                    return record['id']
+            except sqlite3.Error as error:
+                self.persistence_error = str(error)
+                raise
 
     def newer(self, previous, source_ms, received_ms):
         if source_ms is not None and source_ms > received_ms + 5000:
@@ -169,6 +180,9 @@ class Engine:
             self.analyze(record, now)
 
     def save_checkpoint(self):
+        if self.persistence_error:
+            logging.error('Skipped checkpoint of uncommitted reducer state: %s',self.persistence_error)
+            return
         with self.lock, self.store.transaction():
             state = {k: getattr(self,k) for k in ('catalog','events','manual','books','spots','latest','health',
                 'last_raw_id','last_received_ms','delayed_packets','clock_errors','observation_count')}
@@ -270,12 +284,13 @@ class Engine:
         if not self.newer(previous, source_ms, record['received_ms']):
             return
         grouped = defaultdict(list)
+        puts = defaultdict(list)
         if record['source'] == 'deribit':
             months = dict(zip('JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC'.split(), range(1, 13)))
             from datetime import datetime, timezone
             import re
             for raw in payload.get('result', []):
-                match = re.fullmatch(r'([A-Z]+)-(\d{1,2})([A-Z]{3})(\d{2})-([\d.]+)-C', str(raw.get('instrument_name', '')))
+                match = re.fullmatch(r'([A-Z]+)-(\d{1,2})([A-Z]{3})(\d{2})-([\d.]+)-([CP])', str(raw.get('instrument_name', '')))
                 if not match:
                     continue
                 expiry = int(datetime(2000 + int(match[4]), months[match[3]], int(match[2]), 8, tzinfo=timezone.utc).timestamp() * 1000)
@@ -283,7 +298,9 @@ class Engine:
                 def price(name):
                     value = number(raw.get(name))
                     return value * forward if value is not None and forward is not None and forward > 0 else None
-                grouped[expiry].append(dict(instrument=raw['instrument_name'], strike=float(match[5]), option_type='call',
+                grouped[expiry]  # Retain expiries that currently have only puts.
+                target = grouped if match[6]=='C' else puts
+                target[expiry].append(dict(instrument=raw['instrument_name'], strike=float(match[5]), option_type='call' if match[6]=='C' else 'put',
                     bid=price('bid_price'), ask=price('ask_price'), mark=price('mark_price'),
                     iv=number(raw.get('mark_iv')) / 100 if number(raw.get('mark_iv')) is not None else None,
                     forward=forward, source_ms=timestamp(raw.get('creation_timestamp')) or source_ms))
@@ -293,7 +310,7 @@ class Engine:
             if number(payload.get('spot')) is not None:
                 self.spots[asset] = dict(price=payload['spot'], raw_id=record['id'], source_ms=payload.get('spot_source_ms') or record['received_ms'], received_ms=record['received_ms'], venue='yahoo', timestamp_origin='source' if payload.get('spot_source_ms') else 'retrieval_unknown_delay',context=payload.get('underlying_context',{}))
         for expiry, calls in grouped.items():
-            self.surfaces[(asset, expiry)] = dict(venue=record['source'], expiry=expiry, calls=calls,
+            self.surfaces[(asset, expiry)] = dict(venue=record['source'], expiry=expiry, calls=calls, puts=puts[expiry],
                 source_ms=source_ms if source_ms is not None else record['received_ms'], received_ms=record['received_ms'], raw_id=record['id'],
                 timestamp_origin='source' if source_ms is not None else 'retrieval_snapshot',
                 forward=next((c.get('forward') for c in calls if c.get('forward')), None))
@@ -355,6 +372,8 @@ class Engine:
                 pm=pm.get('raw_id') if pm else None, options=surface.get('raw_id') if surface else None,
                 spot=spot.get('raw_id') if spot else None, history=history.get('raw_id') if history else None).items() if v is not None})
         row.update(discrepancy(row['pm_yes'], row['opt_yes']))
+        if row['relative_gap'] is None and row['gap_pp'] is not None and (row['opt_yes'] or 0)>0:
+            row['quality_flags'].append('RELATIVE_GAP_OVERFLOW')
         # Timers record state transitions and supply a regular causal analysis clock. All source updates remain raw.
         self.dynamics.update(row)
         self.latest[event['event_id']] = row

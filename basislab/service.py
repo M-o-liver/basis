@@ -53,14 +53,14 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
             except (BrokenPipeError, ConnectionResetError):
                 pass
         def do_GET(self):
-            path = urlparse(self.path); q = parse_qs(path.query)
+            path = urlparse(self.path); q = parse_qs(path.query,keep_blank_values=True)
             try:
                 if path.path == '/api/state':
                     data = engine.snapshot(); data.pop('catalog', None); data['collector'] = dict(running=bool(collector.thread and collector.thread.is_alive()), failure=collector.failed)
                     data['phase2']=dict(enabled=True,mode='experimental_paper',automated_policies=True,research_acceptance='open',reason='Versioned diagnostic policies and manual paper; no real orders')
                     self.send(200, data)
                 elif path.path == '/api/wallets':
-                    self.send(200,paper.snapshot())
+                    self.send(200,paper.snapshot(q.get('wallet',[None])[0],int(q['run_id'][0]) if 'run_id' in q else None))
                 elif path.path == '/api/review':
                     with paper.lock:self.send(200,paper.performance.report)
                 elif path.path == '/api/theses':
@@ -68,24 +68,33 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                 elif path.path == '/api/equity':
                     self.send(200,paper.curves(float(q.get('hours',[24])[0]),int(q['run_id'][0]) if 'run_id' in q else None))
                 elif path.path == '/api/instruments':
-                    self.send(200,dict(rows=paper.instruments(q.get('event_id',[None])[0],q.get('asset',[None])[0])))
-                elif path.path == '/api/positions':
-                    with paper.lock:self.send(200,dict(rows=paper.metrics(q.get('wallet',['OLIVER'])[0])['positions']))
-                elif path.path == '/api/history':
-                    self.send(200,dict(rows=paper.history(q.get('wallet',['OLIVER'])[0],int(q['run_id'][0]) if 'run_id' in q else None,q.get('limit',[100])[0])))
+                    self.send(200,paper.instruments(q.get('event_id',[None])[0],q.get('asset',[None])[0]))
+                elif path.path == '/api/order':
+                    data=paper.order_status(q.get('order_id',[''])[0])
+                    self.send(200 if data else 404,data or dict(error='No such paper order'))
+                elif path.path in ('/api/positions','/api/history'):
+                    wallet=q.get('wallet',['OLIVER'])[0];run_id=int(q['run_id'][0]) if 'run_id' in q else None
+                    with paper.lock:
+                        run,_,archived=paper.resolve_run(wallet,run_id)
+                        positions=path.path=='/api/positions'
+                        rows=paper.metrics(wallet,run_id)['positions'] if positions else paper.history(wallet,run_id,q.get('limit',[100])[0],activity_only=True)
+                        self.send(200,dict(rows=rows,wallet=wallet,run_id=run['id'],archived=archived,runs=paper.wallet_runs(wallet),
+                            empty_reason=f'No {wallet} '+('positions' if positions else 'order or trade activity')+f' in run {run["run_number"]}.',
+                            note='Archived positions use retained marks.' if positions else 'Orders, fills, rejections, cancellations, settlements and controls; periodic marks omitted.'))
                 elif path.path == '/api/catalog':
                     with engine.lock:
                         self.send(200, dict(rows=list(engine.catalog.values())))
                 elif path.path == '/api/health':
                     self.send(200, dict(ok=not collector.failed, collecting=bool(collector.thread and collector.thread.is_alive()), versions=engine.snapshot()['versions']))
                 elif path.path == '/api/replay':
-                    self.send(200, dict(rows=store.history(q.get('event_id', [None])[0], int(q.get('from', [0])[0]), int(q.get('to', [2**63-1])[0]), int(q.get('limit', [500])[0]), int(q.get('after', [0])[0]), q.get('tail', ['0'])[0] == '1', int(q.get('before', [2**63-1])[0]))))
+                    self.send(200, dict(rows=store.history(q.get('event_id', [None])[0], int(q.get('from', [0])[0]), int(q.get('to', [2**63-1])[0]), int(q.get('limit', [500])[0]), int(q.get('after', [0])[0]), q.get('tail', ['0'])[0] == '1', int(q.get('before', [2**63-1])[0])),global_count=store.research_count('replay'),empty_reason='No recorded observations in this scope/page.'))
                 elif path.path == '/api/raw':
                     row = store.raw_record(int(q.get('id', [0])[0])); self.send(200 if row else 404, row or dict(error='No such raw record'))
                 elif path.path == '/api/episodes':
-                    self.send(200, dict(rows=store.latest('episodes', 'gap_event_id', 500)))
+                    self.send(200, dict(rows=store.latest('episodes', 'gap_event_id', 500,q.get('event_id',[None])[0]),global_count=store.research_count('episodes'),empty_reason='No gap episodes in this scope. Episodes require the configured opening threshold.'))
                 elif path.path == '/api/algos':
-                    self.send(200, dict(rows=store.latest('analyzers', 'scope,algo_name', 1000)))
+                    minutes=engine.config.analysis_window*2*engine.config.analysis_grid_seconds/60
+                    self.send(200, dict(rows=store.latest('analyzers', 'scope,algo_name', 1000,q.get('event_id',[None])[0]),global_count=store.research_count('algos'),empty_reason=f'No analyzer output in this scope. Distribution diagnostics need about {minutes:g} minutes of continuous fresh history.'))
                 else:
                     static = {'/': 'index.html', '/index.html': 'index.html', '/styles.css': 'styles.css', '/app.js': 'app.js'}
                     name = static.get(path.path)
@@ -98,7 +107,10 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                     self.send_header('Cache-Control', 'no-cache')
                     self.end_headers(); self.wfile.write(content)
             except (ValueError, TypeError, KeyError) as error:
-                self.send(400, dict(error=str(error)))
+                self.send(400, dict(error=str(error),code=getattr(error,'code','INVALID_REQUEST')))
+            except Exception as error:
+                logging.exception('BASIS GET %s failed',path.path)
+                self.send(500,dict(error=str(error),code='INTERNAL_ERROR'))
         def do_POST(self):
             # Same-origin local control only; no CORS or remote account operations.
             origin = self.headers.get('Origin')
@@ -138,7 +150,10 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                 else:
                     self.send(404, dict(error='Not found'))
             except (ValueError, TypeError, KeyError) as error:
-                self.send(400, dict(error=str(error)))
+                self.send(400, dict(error=str(error),code=getattr(error,'code','INVALID_REQUEST')))
+            except Exception as error:
+                logging.exception('BASIS POST %s failed',self.path)
+                self.send(500,dict(error=str(error),code='INTERNAL_ERROR'))
 
     httpd = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     if collect:
