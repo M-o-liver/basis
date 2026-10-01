@@ -71,3 +71,12 @@ The replacement adds compressed observations, bounded compact rolling history, n
 | Unattended operation | **Not passed.** Validate the revised collector through an extended run and deliberate restart; inspect memory, disk growth, stale intervals, quarantine and replay. |
 
 The revised collector passed 41 research tests. A raw-integrity scan verified 911,246 payload hashes and SQLite quick_check returned ok. Graceful checkpoint restart took 1.5 seconds; a forced collector exit recovered under the userland supervisor in 6 seconds with no quarantined records. Extended unattended acceptance remains open. Manual paper functionality is documented in README; automatic strategy policies remain disabled.
+
+## 2026-10-01 — prospective evaluation
+
+The earlier dated findings above are preserved. An independent prospective
+campaign is now permanently registered on storage v2; its protocol, actual
+runtime evidence and outstanding scientific limitations are recorded in
+[the prospective evaluation record](prospective-evaluation-2026-10-01.md).
+Current status is **INSUFFICIENT_PROSPECTIVE_SAMPLE**. This does not change the
+operational gates or claim an informational/trading edge.

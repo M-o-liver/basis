@@ -303,10 +303,15 @@ def report(tape, evaluation_id=None, mode='PROSPECTIVE', episode_id=None):
             matched_controls=matched)
         if name in protocol['horizons']:
             strat=defaultdict(list)
+            assets=defaultdict(list);classes=defaultdict(list)
             for e,o in pairs:
                 strat[e['session']['regime']].append((e,o))
                 if e['session']['expiry_near']:strat['EXPIRY_NEAR'].append((e,o))
+                assets[e['asset']].append((e,o))
+                classes['CRYPTO' if e['asset'] in ('BTC','ETH') else 'EQUITY_PROXY'].append((e,o))
             horizon['session_regimes']={k:summarize(v,protocol) for k,v in sorted(strat.items())}
+            horizon['assets']={k:summarize(v,protocol) for k,v in sorted(assets.items())}
+            horizon['asset_classes']={k:summarize(v,protocol) for k,v in sorted(classes.items())}
         horizons[name]=horizon
     baselines={}
     selections={

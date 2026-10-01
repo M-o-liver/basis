@@ -106,6 +106,24 @@ at least 10× measured reduction and <150 MiB/hour. It never rewrites the legacy
 resets wallets or starts a new scientific campaign. See the
 [actual storage profile and validation](docs/storage-profile-2026-10-01.md).
 
+## Prospective informational evaluation
+
+```sh
+./basis evaluate
+./basis evaluate --json
+./basis evaluate --historical --from 2026-10-01T21:05:00Z --to 2026-10-01T21:08:00Z --json
+```
+
+The independent evaluator freezes episode openings and fixed-horizon outcomes in
+`data/basis.evaluation.sqlite3`, without changing live models or paper policies.
+It reports conventional repricing toward opening Poly, convergence, matched
+controls, spot/session conditioning, analyzer overlap/incremental value, curves
+and unique-event calibration. Missing data stays explicit. Frames are not
+independent experiments. The irreversible prospective boundary is
+**2026-10-01 21:09:05.802 UTC**, raw **21,952,685**, frame **67,942,860**.
+The current conclusion is **INSUFFICIENT_PROSPECTIVE_SAMPLE**. See the
+[frozen protocol, actual evidence and limits](docs/prospective-evaluation-2026-10-01.md).
+
 ## Controls
 
 Web views: **1 Monitor, 2 Markets, 3 Tape, 4 Gaps, 5 Algos, 6 Curves, 7 Health**. `/` or Ctrl-K filters; j/k or arrows select; Enter opens details; Escape returns; `[`/`]` page; R refreshes discovery; L edits a mapping; P pauses display; `?` shows help. Pausing never pauses collection.
@@ -186,7 +204,7 @@ node --check app.js
 
 Tests cover conversions, sign/REL, finite values, semantics, timestamps, provenance, stale/crossed/delayed sources, malformed packets, path history, immutable records, hashes, causal replay, disk reopen/checkpoints, memory bounds, travel, lifecycle, curves and synthetic analyzer behavior.
 
-**Manual paper execution is available as an experiment, at the operator's request.** Research acceptance remains open; versioned experimental analyzer policies are enabled. See [the acceptance record](docs/phase1-acceptance.md). Outcome ingestion/calibration, exact settlement feeds and more sophisticated probability surfaces remain research work; convergence is not a substitute.
+**Manual paper execution is available as an experiment, at the operator's request.** Research acceptance remains open; versioned experimental analyzer policies are enabled. See [the acceptance record](docs/phase1-acceptance.md). Prospective evaluation and immutable official-resolution ingestion now exist, but calibration and edge conclusions still require sufficient trustworthy outcomes; convergence is not a substitute.
 
 ## Paper wallets
 
