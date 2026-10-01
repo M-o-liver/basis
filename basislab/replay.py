@@ -85,11 +85,17 @@ def archived_engine(store, revision):
 def verify_replay(store, until=None):
     # Capture a stable prefix even while the live collector continues appending.
     with store.lock:
-        boundary = store.db.execute('SELECT COALESCE(MAX(id),0) FROM raw WHERE (? IS NULL OR received_ms<=?)', (until, until)).fetchone()[0]
+        if hasattr(store,'iter_observations'):
+            boundary=store.stats_counts()['raw']
+            if until is not None:
+                boundary=max((r['id'] for r in store.raw(until=until)),default=0)
+            observations=store.iter_observations(boundary)
+        else:
+            boundary = store.db.execute('SELECT COALESCE(MAX(id),0) FROM raw WHERE (? IS NULL OR received_ms<=?)', (until, until)).fetchone()[0]
+            observations=((r['raw_id'],decode(r['data'])) for r in store.db.execute('SELECT raw_id,data FROM observations WHERE raw_id<=? ORDER BY id',(boundary,)))
         versions = {}
-        for row in store.db.execute('SELECT raw_id,data FROM observations WHERE raw_id<=? ORDER BY id', (boundary,)):
-            data=decode(row['data'])
-            versions[data['code_hash']] = max(versions.get(data['code_hash'],0), row['raw_id'])
+        for raw_id,data in observations:
+            versions[data['code_hash']] = max(versions.get(data['code_hash'],0),raw_id)
     checked, mismatches, unsupported = 0, [], []
     for revision, last_raw in versions.items():
         engine = archived_engine(store, revision)
@@ -100,9 +106,8 @@ def verify_replay(store, until=None):
                 break
             engine.apply(record)
             with store.lock:
-                rows = store.db.execute('SELECT data FROM observations WHERE raw_id=? ORDER BY id', (record['id'],)).fetchall()
-            for stored in rows:
-                expected = decode(stored['data'])
+                rows = store.frames_at(record['id']) if hasattr(store,'frames_at') else [decode(r['data']) for r in store.db.execute('SELECT data FROM observations WHERE raw_id=? ORDER BY id',(record['id'],))]
+            for expected in rows:
                 if expected['code_hash'] != revision:
                     continue
                 actual = engine.latest.get(expected['event_id']); checked += 1

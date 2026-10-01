@@ -1,5 +1,7 @@
 # Phase 1 acceptance record
 
+Storage update on 2026-10-01: [measured storage profile, exact replay and preserving v2 cutover](storage-profile-2026-10-01.md). This retains old failures and does not pass future duration gates.
+
 Operational update on 2026-10-01: [dated operational acceptance evidence](operational-acceptance-2026-10-01.md)
 adds bounded chronological verification, persisted continuity/source accounting,
 recovery exercises and explicit 24h/72h/7d gates. The earlier findings below remain

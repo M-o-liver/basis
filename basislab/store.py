@@ -156,24 +156,57 @@ class Store:
             return data
 
     def history(self, event_id=None, start=0, end=2**63-1, limit=500, after_id=0, tail=False, before_id=2**63-1):
-        with self.lock:
+        with self.reader() as db:
             order = 'DESC' if tail else 'ASC'
-            rows = self.db.execute(f'SELECT id,data FROM observations WHERE (? IS NULL OR event_id=?) AND timestamp_ms BETWEEN ? AND ? AND id>? AND id<? ORDER BY id {order} LIMIT ?', (event_id, event_id, start, end, after_id, before_id, max(0,min(limit,10000)))).fetchall()
+            # Select IDs from the covering event index before fetching large
+            # blobs. An optional-parameter OR made empty selected scopes scan
+            # the entire tape while holding the collector's connection lock.
+            where='timestamp_ms BETWEEN ? AND ? AND id>? AND id<?'
+            args=[start,end,after_id,before_id]
+            index=''
+            if event_id is not None:
+                where='event_id=? AND '+where;args.insert(0,event_id)
+                index=' INDEXED BY obs_event'
+            ids=[r[0] for r in db.execute(f'SELECT id FROM observations{index} WHERE {where} ORDER BY id {order} LIMIT ?',
+                                        (*args,max(0,min(limit,10000))))]
+            rows=[db.execute('SELECT id,data FROM observations WHERE id=?',(i,)).fetchone() for i in ids]
         return [dict(decode(row['data']), observation_id=row['id']) for row in (reversed(rows) if tail else rows)]
 
     def latest(self, table, key, limit=200, event_id=None):
         if (table, key) not in {('episodes', 'gap_event_id'), ('analyzers', 'scope,algo_name'), ('observations', 'event_id')}:
             raise ValueError('Unsupported table')
-        with self.lock:
+        with self.reader() as db:
             field='scope' if table=='analyzers' else 'event_id'
-            rows = self.db.execute(f'SELECT id,data FROM {table} WHERE id IN (SELECT MAX(id) FROM {table} GROUP BY {key}) AND (? IS NULL OR {field}=?) ORDER BY id DESC LIMIT ?', (event_id,event_id,limit)).fetchall()
+            where=f' WHERE {field}=?' if event_id is not None else ''
+            args=(event_id,limit) if event_id is not None else (limit,)
+            rows = db.execute(f'SELECT id,data FROM {table} WHERE id IN (SELECT MAX(id) FROM {table}{where} GROUP BY {key}) ORDER BY id DESC LIMIT ?',args).fetchall()
         return [dict(decode(row['data']), record_id=row['id']) for row in rows]
 
     def research_count(self,view):
-        with self.lock:
-            if view=='replay':return self.db.execute('SELECT COALESCE(MAX(id),0) FROM observations').fetchone()[0]
+        with self.reader() as db:
+            if view=='replay':return db.execute('SELECT COALESCE(MAX(id),0) FROM observations').fetchone()[0]
             table,key={'episodes':('episodes','gap_event_id'),'algos':('analyzers','scope,algo_name')}[view]
-            return self.db.execute(f'SELECT COUNT(*) FROM (SELECT 1 FROM {table} GROUP BY {key})').fetchone()[0]
+            return db.execute(f'SELECT COUNT(*) FROM (SELECT 1 FROM {table} GROUP BY {key})').fetchone()[0]
+
+    @contextmanager
+    def reader(self):
+        """Short bounded history queries never occupy the recorder connection."""
+        if self.path==':memory:':
+            with self.lock:yield self.db
+            return
+        db=sqlite3.connect(Path(self.path).resolve().as_uri()+'?mode=ro'+('&immutable=1' if getattr(self,'immutable',False) else ''),uri=True,timeout=5,isolation_level=None)
+        db.row_factory=sqlite3.Row
+        deadline=time.monotonic()+5
+        db.set_progress_handler(lambda:time.monotonic()>deadline,10000)
+        try:yield db
+        except sqlite3.OperationalError as error:
+            if str(error)=='interrupted':raise RuntimeError('Historical request exceeded the 5s read budget; narrow its scope') from error
+            raise
+        finally:db.close()
+
+    def logical_bytes(self):
+        with self.lock:
+            return self.db.execute('PRAGMA page_count').fetchone()[0]*self.db.execute('PRAGMA page_size').fetchone()[0]
 
     def stats(self):
         with self.lock:

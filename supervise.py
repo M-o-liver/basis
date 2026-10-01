@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--config')
     parser.add_argument('--no-collect',action='store_true')
     args=parser.parse_args()
+    args.db=str(Path(args.db).resolve())
     Path(args.db).parent.mkdir(parents=True,exist_ok=True)
     lock=open(args.db+'.supervisor.lock','a')
     try:

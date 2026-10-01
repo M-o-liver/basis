@@ -64,17 +64,47 @@ Stop that process with SIGTERM; shutdown commits a checkpoint. The userland supe
 health, resource measurements, checkpoint/recovery evidence and sampled replay.
 Normal replay has a 25-second/70,000-record budget. A first marker projection is
 incremental and may need another run to finish; incomplete coverage is explicit.
-`--deep` expands replay to 180 seconds/400,000 records and refreshes SQLite
-quick_check evidence if none exists or it is older than 24 hours. `--quick-check`
-forces that full scan, which can take tens of minutes on a large tape and
-temporarily grow its WAL. Routine reports show the dated integrity result and
-its raw boundary. Unverified replay regions never count as matches.
+`--deep` expands replay to 180 seconds/400,000 records. For a legacy v1 tape,
+only explicit `--quick-check` runs the full structural scan, which can take tens
+of minutes and grow a live WAL. For v2, routine acceptance checks the small active
+segment, reuses integrity/hash evidence for unchanged immutable closed segments,
+and retains the frozen legacy tape's dated result and checked boundary separately.
+Unverified replay regions never count as matches.
 
 The 24-hour, 72-hour and 7-day gates count timer-covered recording time in a
 campaign that starts once at the first instrumented service start. Older
 interruptions and historical gates remain visible. See the
 [operational acceptance record](docs/operational-acceptance-2026-10-01.md) for
 criteria, measured evidence and remaining limits. Extended acceptance remains open.
+
+## Compact research tapes
+
+Storage v2 preserves every logical source event and native timestamp with lossless
+bounded anchor/delta encoding. Typed one-second research frames reference immutable
+event semantics, model inputs, depth and stock context; salient changes retain exact
+causal times. The unchanged reducer still processes every source tick. Full subsecond
+state and intermediate episode evolution are reconstructed from raw, rather than
+copied into redundant JSON rows. Analyzer outputs and paper execution rules are unchanged.
+
+Segments rotate at 256 MiB or a UTC day boundary. Closed segments are checked, hashed
+and read-only. Global IDs span the preserved legacy database and new segments.
+The existing `--db` path remains the API/CLI alias; `<db>.storage.json` points to the
+manifest. Backups must retain that pointer, the manifest, **every segment**, the legacy
+database, `versions/`, and the existing paper/acceptance sidecars. Copy active SQLite
+databases using a SQLite-aware backup or after a graceful stop; never remove WAL files.
+
+The explicit migration commands are:
+
+```sh
+./basis storage-shadow --output data/storage-validation --minutes 30
+# Stop the supervisor normally before cutover; committed legacy WAL must be checkpointed.
+./basis storage-cutover --tape-dir data/tape --validation data/storage-validation/validation.json
+```
+
+Cutover requires a completed passing ≥30-minute same-stream shadow, exact replay,
+at least 10× measured reduction and <150 MiB/hour. It never rewrites the legacy tape,
+resets wallets or starts a new scientific campaign. See the
+[actual storage profile and validation](docs/storage-profile-2026-10-01.md).
 
 ## Controls
 
