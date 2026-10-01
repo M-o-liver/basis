@@ -1,7 +1,7 @@
 """Public read-only feeds, independent of any browser. Bounded requests, reconnects, no credentials."""
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import shutil
@@ -19,6 +19,19 @@ def get_json(url):
     request = urllib.request.Request(url, headers={'User-Agent': 'BasisResearch/1.0', 'Accept': 'application/json'})
     with urllib.request.urlopen(request, timeout=12) as response:
         return json.load(response)
+
+
+def price_event_slugs(now):
+    slugs=[]
+    for offset in (0,1):
+        month=(now.month-1+offset)%12+1
+        year=now.year+(now.month-1+offset)//12
+        period=datetime(year,month,1).strftime('%B-%Y').lower()
+        day=now+timedelta(days=offset)
+        daily=f'{day.strftime("%B").lower()}-{day.day}-{day.year}'
+        for asset in ('bitcoin','ethereum'):
+            slugs.extend((f'what-price-will-{asset}-hit-in-{period}',f'{asset}-above-on-{daily}'))
+    return slugs
 
 
 class Collector:
@@ -94,13 +107,8 @@ class Collector:
                                 break
                     except Exception as error:
                         errors.append(dict(tag=tag_name, error=type(error).__name__))
-                current = datetime.now(timezone.utc)
-                for offset in (0, 1):
-                    month = (current.month - 1 + offset) % 12 + 1
-                    year = current.year + (current.month - 1 + offset) // 12
-                    period = datetime(year, month, 1).strftime('%B-%Y').lower()
-                    for asset in ('bitcoin', 'ethereum'):
-                        await page(f'{GAMMA}/events/slug/what-price-will-{asset}-hit-in-{period}', events=True)
+                for slug in price_event_slugs(datetime.now(timezone.utc)):
+                    await page(f'{GAMMA}/events/slug/{slug}',events=True)
                 if not rows:
                     raise ValueError('No catalog rows returned')
                 self.engine.ingest('polymarket_gamma', 'catalog', 'public', dict(markets=rows, requested_urls=urls, partial_errors=errors))

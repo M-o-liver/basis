@@ -9,19 +9,25 @@ NY=ZoneInfo('America/New_York')
 _catalysts={}
 
 
-@lru_cache(maxsize=1)
-def calendar():
+@lru_cache(maxsize=4)
+def _calendar(year):
     import exchange_calendars
-    return exchange_calendars.get_calendar('XNYS')
+    # The library's default ends one year from today, before listed LEAPS.
+    return exchange_calendars.get_calendar('XNYS',start=f'{year-20}-01-01',end=f'{year+2}-12-31')
+
+
+def calendar(date=None):
+    year=datetime.fromisoformat(str(date)).year if date is not None else datetime.now(NY).year
+    return _calendar(year)
 
 
 def session_close(date):
-    cal=calendar()
+    cal=calendar(date)
     return int(cal.session_close(date).timestamp()*1000) if cal.is_session(date) else None
 
 
 def regular_session(now):
-    cal=calendar();day=datetime.fromtimestamp(now/1000,NY).date().isoformat()
+    day=datetime.fromtimestamp(now/1000,NY).date().isoformat();cal=calendar(day)
     is_open=cal.is_session(day) and cal.session_open(day).timestamp()*1000<=now<cal.session_close(day).timestamp()*1000
     return dict(market_state='OPEN' if is_open else 'CLOSED')
 
@@ -30,7 +36,7 @@ def snapshot(asset,cutoffs,starts,offset_hours,now=None):
     import exchange_calendars
     import yfinance as yf
     now=now or time.time_ns()//1000000
-    cal=calendar();today=datetime.fromtimestamp(now/1000,NY).date().isoformat()
+    today=datetime.fromtimestamp(now/1000,NY).date().isoformat();cal=calendar(today)
     ticker=yf.Ticker(asset)
     daily=ticker.history(period='3mo',interval='1d',auto_adjust=False,prepost=False,actions=True,raise_errors=True,timeout=12)
     if daily.empty:raise ValueError('No stock history returned')
@@ -70,14 +76,25 @@ def snapshot(asset,cutoffs,starts,offset_hours,now=None):
                 ex_dividend=str(raw.get('Ex-Dividend Date') or ''),retrieved_ms=now)
         except Exception as error:catalyst=dict(status='UNKNOWN',error=type(error).__name__,earnings_dates=[],retrieved_ms=now)
         _catalysts[asset]=catalyst
-    chains=[];errors=[];dates=[]
+    chains=[];errors=[];dates=[];coverage=[];choices=set();expiries={}
     try:
-        dates=list(ticker.options);choices=set()
-        for cutoff in cutoffs:
-            for date in dates:
+        dates=list(ticker.options)
+        for date in sorted(dates):
+            try:
                 expiry=session_close(date)
-                if expiry is not None and 0<=expiry-cutoff<=offset_hours*3600000:choices.add(date);break
-        for date in sorted(choices)[:3]:
+                if expiry is not None:expiries[date]=expiry
+            except Exception as error:
+                errors.append(dict(stage='expiry',date=date,error=type(error).__name__,detail=str(error)[:150]))
+        for cutoff in sorted(cutoffs):
+            date=next((d for d,e in expiries.items() if e>=cutoff),None)
+            expiry=expiries.get(date)
+            coverage.append(dict(cutoff=cutoff,option_expiry=expiry,within_model_window=expiry is not None and expiry-cutoff<=offset_hours*3600000))
+            # Retain real instruments even outside the probability model's window.
+            # derive() remains responsible for rejecting an incompatible expiry.
+            if date is not None:choices.add(date)
+    except Exception as error:errors.append(dict(stage='options',error=type(error).__name__,detail=str(error)[:150]))
+    for date in sorted(choices)[:3]:
+        try:
             chain=ticker.option_chain(date)
             def contracts(frame,kind):
                 if frame is None:return []
@@ -85,10 +102,10 @@ def snapshot(asset,cutoffs,starts,offset_hours,now=None):
                     mark=number(r['lastPrice']),iv=number(r['impliedVolatility']),option_type=kind,
                     last_trade=str(r['lastTradeDate']),volume=number(r['volume']),open_interest=number(r['openInterest']),
                     contract_size=str(r.get('contractSize','')),currency=str(r.get('currency',''))) for r in frame.to_dict(orient='records') if number(r.get('strike'))]
-            chains.append(dict(expiry=session_close(date),calls=contracts(chain.calls,'call'),puts=contracts(chain.puts,'put')))
-    except Exception as error:errors.append(dict(stage='options',error=type(error).__name__,detail=str(error)[:150]))
+            chains.append(dict(expiry=expiries[date],calls=contracts(chain.calls,'call'),puts=contracts(chain.puts,'put')))
+        except Exception as error:errors.append(dict(stage='options',date=date,error=type(error).__name__,detail=str(error)[:150]))
     return dict(chains=chains,available_expiries=dates,spot=spot,spot_source_ms=source_ms,adapter='yfinance',quote_delay='unknown',
-        histories=histories,partial_errors=errors,underlying_context=dict(asset_class='equity',name=metadata.get('longName') or metadata.get('shortName') or asset,
+        histories=histories,partial_errors=errors,expiry_coverage=coverage,underlying_context=dict(asset_class='equity',name=metadata.get('longName') or metadata.get('shortName') or asset,
             exchange=metadata.get('exchangeName'),session_calendar='XNYS',market_state='OPEN' if is_open else 'CLOSED',
             regular_hours_only=True,price_asof=source_ms,session_returns=changes,catalyst=catalyst,
             corporate_action=any(h['corporate_action'] for h in histories),quote_delay='unknown',daily_candles=[c['candle'] for c in candles[-22:]]))
