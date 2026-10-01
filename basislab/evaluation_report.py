@@ -12,6 +12,7 @@ from .evaluation_features import bin_index, finite, local_iv, sign
 from .store import decode, encode
 
 ALGOS=tuple(name for name in FAMILIES if name!='sequential_martingale')
+REPORT_IMPLEMENTATION_HASH=digest(Path(__file__).read_text())
 
 
 def block(entry):
@@ -331,7 +332,7 @@ def report(tape, evaluation_id=None, mode='PROSPECTIVE', episode_id=None):
         key=encode([e['neighbors']['group'],e['opened_ms']//protocol['control_period_ms']])
         curve_units.setdefault(key,(e,o['curve']))
     curves=list(curve_units.values())
-    return dict(status=status,campaign=campaign,report_implementation_hash=digest(Path(__file__).read_text()),
+    return dict(status=status,campaign=campaign,report_implementation_hash=REPORT_IMPLEMENTATION_HASH,
         elapsed_seconds=(time.time_ns()//1000000-campaign['started_ms'])/1000,
         evidence_units=dict(raw_id_last_processed=progress.get('raw_id'),compact_frames_processed=progress.get('frames_processed',0),
             raw_records_in_processed_prefix=max(0,progress.get('raw_id',0)-campaign['first_eligible_global_raw_id']+1),
