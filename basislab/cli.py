@@ -120,6 +120,14 @@ def main():
     acceptance.add_argument('--json', action='store_true')
     acceptance.add_argument('--deep', action='store_true', help='Larger bounded replay sample; does not rescan frozen legacy data')
     acceptance.add_argument('--quick-check', action='store_true', help='Explicit full v1 SQLite scan; v2 checks its small active segment and reuses closed integrity evidence')
+    evaluation=commands.add_parser('evaluate',help='Frozen episode-level informational evaluation; no trading policy changes')
+    scope=evaluation.add_mutually_exclusive_group()
+    scope.add_argument('--prospective',action='store_true');scope.add_argument('--historical',action='store_true')
+    evaluation.add_argument('--json',action='store_true');evaluation.add_argument('--campaign')
+    evaluation.add_argument('--episode',help='Inspect one frozen opening and its outcomes')
+    evaluation.add_argument('--start',action='store_true',help='Idempotently freeze a permanent prospective boundary from live collector state')
+    evaluation.add_argument('--from',dest='start_time');evaluation.add_argument('--to',dest='end_time')
+    evaluation.add_argument('--register-hypothesis',metavar='JSON',help='Append a new hypothesis version effective only from future raw/frame IDs')
     shadow=commands.add_parser('storage-shadow',help='30–120 minute lossless v2 validation on the existing committed source stream')
     shadow.add_argument('--output',required=True);shadow.add_argument('--minutes',type=float,default=30)
     cutover_parser=commands.add_parser('storage-cutover',help='Initialize validated v2 storage while the legacy writer is stopped; never rewrites history')
@@ -144,6 +152,30 @@ def main():
     p=commands.add_parser('paper-replay');p.add_argument('plan');p.add_argument('--output',required=True)
     p=commands.add_parser('automation');p.add_argument('action',choices=('pause','resume'))
     args = parser.parse_args()
+    if args.command=='evaluate':
+        from .evaluation import freeze_boundary, historical_campaign, register_hypothesis
+        from .evaluation_report import report, text_report
+        if args.start and (args.historical or args.campaign):parser.error('--start freezes the original prospective campaign; cannot relabel historical data')
+        if args.start:
+            import subprocess
+            freeze_boundary(args.db,fetch(args.url,'/api/state'),subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip())
+            # Existing services start their independent evaluator through same-origin local control.
+            post(args.url,'/api/evaluation/start',dict(requested=True))
+        if args.register_hypothesis:
+            print(json.dumps(register_hypothesis(args.db,json.loads(__import__('pathlib').Path(args.register_hypothesis).read_text()),args.campaign),indent=2));return
+        campaign=args.campaign
+        if args.historical and (args.start_time or args.end_time):
+            if not args.start_time or not args.end_time:parser.error('--historical requires both --from and --to')
+            c=historical_campaign(args.db,timestamp(args.start_time),timestamp(args.end_time));campaign=c['evaluation_id']
+            from .evaluation_record import Recorder
+            scorer=Recorder(args.db,campaign)
+            try:
+                for _ in range(100):
+                    if scorer.poll(until_ms=c['end_ms'])<500:break
+            finally:scorer.close()
+        elif (args.start_time or args.end_time):parser.error('--from/--to require --historical')
+        data=report(args.db,campaign,'HISTORICAL' if args.historical else 'PROSPECTIVE',args.episode)
+        print(json.dumps(data,indent=2) if args.json or args.episode else text_report(data));return
     if args.command=='storage-shadow':
         from .storage_shadow import run_shadow
         result=run_shadow(args.db,args.output,args.minutes);print(json.dumps(result,indent=2))
