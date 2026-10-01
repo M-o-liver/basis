@@ -89,6 +89,8 @@ def calibration(forecasts, resolutions, protocol):
             excluded['NOT_YET_OFFICIALLY_RESOLVED']+=1;continue
         if len({r.get('yes') for r in rs})!=1:
             excluded['CONFLICTING_OFFICIAL_RESOLUTIONS']+=1;continue
+        if any(finite(r.get('resolution_timestamp')) and r['resolution_timestamp']<f['timestamp_ms'] for r in rs):
+            excluded['RESOLVED_BEFORE_FORECAST']+=1;continue
         valid=[r for r in rs if r.get('review')=='OFFICIAL_BINARY_API' and r.get('event_version')==f['event_version'] and r['available_ms']>=f['timestamp_ms']]
         if not valid:
             excluded['WORDING_VERSION_OR_REVIEW_UNAVAILABLE']+=1;continue
@@ -270,9 +272,10 @@ def report(tape, evaluation_id=None, mode='PROSPECTIVE', episode_id=None):
     primary=[(e,outcomes[(e['id'],protocol['primary_horizon'])]) for e in eligible
              if outcomes.get((e['id'],protocol['primary_horizon']),{}).get('status')=='OBSERVED']
     blocks={block(e) for e in eligible};unique={e['event_id'] for e in eligible}
-    status='INSUFFICIENT_PROSPECTIVE_SAMPLE' if len(primary)<protocol['minimum_episodes'] or len(unique)<protocol['minimum_unique_events'] or len(blocks)<protocol['minimum_dependence_blocks'] else 'DESCRIPTIVE_PROSPECTIVE_RESULTS; EDGE_NOT_AUTOMATICALLY_PROVEN'
+    primary_events={e['event_id'] for e,o in primary};primary_blocks={block(e) for e,o in primary}
+    status='INSUFFICIENT_PROSPECTIVE_SAMPLE' if len(primary)<protocol['minimum_episodes'] or len(primary_events)<protocol['minimum_unique_events'] or len(primary_blocks)<protocol['minimum_dependence_blocks'] else 'DESCRIPTIVE_PROSPECTIVE_RESULTS; EDGE_NOT_AUTOMATICALLY_PROVEN'
     if progress.get('stopped_versions'):status='ELIGIBILITY_STOPPED; SCIENTIFIC_VERSION_OR_ARCHIVE_CONFLICT'
-    if mode!='PROSPECTIVE':status='EXPLORATORY / HISTORICAL; NOT CONFIRMATORY'
+    if campaign['mode']!='PROSPECTIVE':status='EXPLORATORY / HISTORICAL; NOT CONFIRMATORY'
     by_id={e['id']:e for e in entries};horizons={}
     names=list(protocol['horizons'])+list(protocol['deferred_horizons'])+['FIRST_AVAILABLE_PROXY','expiry','resolution']
     for name in names:
@@ -323,11 +326,13 @@ def report(tape, evaluation_id=None, mode='PROSPECTIVE', episode_id=None):
         key=encode([e['neighbors']['group'],e['opened_ms']//protocol['control_period_ms']])
         curve_units.setdefault(key,(e,o['curve']))
     curves=list(curve_units.values())
-    return dict(status=status,campaign=campaign,elapsed_seconds=(time.time_ns()//1000000-campaign['started_ms'])/1000,
+    return dict(status=status,campaign=campaign,report_implementation_hash=digest(Path(__file__).read_text()),
+        elapsed_seconds=(time.time_ns()//1000000-campaign['started_ms'])/1000,
         evidence_units=dict(raw_id_last_processed=progress.get('raw_id'),compact_frames_processed=progress.get('frames_processed',0),
             raw_records_in_processed_prefix=max(0,progress.get('raw_id',0)-campaign['first_eligible_global_raw_id']+1),
             observed_episode_horizon_outcomes=sum(o['status']=='OBSERVED' for (key,name),o in outcomes.items() if by_id[key]['kind']!='CONTROL'),
             episode_entries=len(episodes),eligible_episode_entries=len(eligible),unique_events=len(unique),asset_day_blocks=len(blocks),
+            primary_scored_episodes=len(primary),primary_scored_events=len(primary_events),primary_scored_dependence_blocks=len(primary_blocks),
             control_moments=sum(e['kind']=='CONTROL' for e in entries),unique_forecast_events=len(forecasts),
             ineligible_entry_reasons=dict(Counter(e.get('ineligible_reason') for e in episodes if not e['eligible'])),
             entry_origins=dict(Counter(e.get('entry_origin','DEFERRED_RESPONSE') for e in episodes)),

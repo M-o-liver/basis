@@ -238,7 +238,9 @@ def historical_campaign(tape, start, end):
         raise ValueError('Historical evaluation requires an explicit positive range of at most six hours; repeat the command to resume its bounded cursor')
     db=EvaluationDB(tape);reader=open_store(tape,read_only=True)
     try:
-        rows=reader.history(start=start,end=end,limit=500)
+        from .evaluation_record import EvidenceReader
+        first_id=EvidenceReader(reader).first_frame_in_range(start,end)
+        rows=reader.history(start=start,end=end,limit=500,after_id=first_id-1) if first_id is not None else []
         if not rows:raise ValueError('No frames in the historical range')
         first=rows[0];code=first.get('code_hash')
         identity='basis-historical-'+digest([str(Path(tape).resolve()),start,end,VERSION])[:12]

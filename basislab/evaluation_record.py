@@ -37,6 +37,24 @@ class EvidenceReader:
         if self.tape.legacy:
             yield self.tape.legacy
 
+    def first_frame_in_range(self,start,end):
+        """Receipt-clamped frame clocks are nondecreasing; navigate by PK probes, not a v1 scan."""
+        for source in reversed(list(self.sources(2**63-1))):
+            table,column=('frames','timestamp_wall') if hasattr(source,'codec') else ('observations','timestamp_ms')
+            ceiling=getattr(source,'limits',{}).get('observations',2**63-1)
+            first=source.db.execute(f'SELECT id,{column} stamp FROM {table} WHERE id<=? ORDER BY id LIMIT 1',(ceiling,)).fetchone()
+            last=source.db.execute(f'SELECT id,{column} stamp FROM {table} WHERE id<=? ORDER BY id DESC LIMIT 1',(ceiling,)).fetchone()
+            if not first or first['stamp']>end or last['stamp']<start:continue
+            lo,hi=first['id'],last['id']
+            while lo<=hi:
+                mid=(lo+hi)//2
+                row=source.db.execute(f'SELECT id,{column} stamp FROM {table} WHERE id>=? AND id<=? ORDER BY id LIMIT 1',(mid,hi)).fetchone()
+                if not row or row['stamp']>=start:hi=mid-1
+                else:lo=row['id']+1
+            row=source.db.execute(f'SELECT id,{column} stamp FROM {table} WHERE id>=? AND id<=? ORDER BY id LIMIT 1',(lo,last['id'])).fetchone()
+            if row and row['stamp']<=end:return row['id']
+        return None
+
     def analyzers(self, scope, raw_id, now, protocol):
         result = {}
         sources = list(self.sources(raw_id))
@@ -146,7 +164,7 @@ class Recorder:
             analyzers=self.reader.analyzers(row['event_id'],row['raw_id'],now,self.protocol),
             native_recent_events=self.reader.salient(row['event_id'],row['raw_id'],now),
             entry_recorded_at_ms=time.time_ns()//1000000,
-            creation_mode='CAUSAL_RECONSTRUCTION_OF_PRE_REGISTERED_FRAME_ENTRY')
+            creation_mode='CAUSAL_RECONSTRUCTION_OF_PRE_REGISTERED_FRAME_ENTRY' if self.campaign['mode']=='PROSPECTIVE' else 'EXPLORATORY_RECONSTRUCTION; REGISTERED_AFTER_DATA')
         for hypothesis in self.hypotheses:
             if hypothesis['definition']!=TEMPORAL_HYPOTHESIS or row['raw_id']<hypothesis['effective_raw_id'] or row['observation_id']<hypothesis['effective_frame_id']:
                 continue
@@ -365,6 +383,11 @@ class Recorder:
                 now = min(time.time_ns()//1000000,until_ms) if until_ms is not None else time.time_ns()//1000000
                 self.finalize(now,inclusive=True)
                 self.expire_first_print(now)
+                if self.campaign['mode']=='HISTORICAL' and until_ms==self.campaign.get('end_ms'):
+                    while self.pending:
+                        due,key,name=heapq.heappop(self.pending)
+                        entry=decode(self.db.db.execute('SELECT data FROM entries WHERE id=?',(key,)).fetchone()[0])
+                        self.record_outcome(entry,name,due,dict(status='MISSING',reason='HISTORICAL_RANGE_RIGHT_CENSORED',due_ms=due))
             self.prune_working_state()
             self.db.db.execute('INSERT INTO progress VALUES(?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE '
                 'SET frame_id=excluded.frame_id,updated_ms=excluded.updated_ms,data=excluded.data',

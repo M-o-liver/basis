@@ -10,7 +10,7 @@ from basislab import CALCULATION_VERSION, FEATURE_VERSION
 from basislab.evaluation import EvaluationDB, PROTOCOL, freeze_boundary
 from basislab.evaluation_features import horizon_outcome, semantic_version, session_regime, temporal_predictor
 from basislab.evaluation_record import EvidenceReader, Recorder
-from basislab.evaluation_report import analyzer_overlap, calibration
+from basislab.evaluation_report import analyzer_overlap, calibration, report
 from basislab.evaluation_resolutions import official_result
 from basislab.engine import Engine
 from basislab.store import Store, decode, encode
@@ -41,6 +41,8 @@ class Tape:
         self.rows=rows
         self.db=sqlite3.connect(':memory:');self.db.row_factory=sqlite3.Row
         self.db.execute('CREATE TABLE analyzers(id INTEGER PRIMARY KEY,raw_id INTEGER,timestamp_ms INTEGER,algo_name TEXT,scope TEXT,data TEXT)')
+        self.db.execute('CREATE TABLE observations(id INTEGER PRIMARY KEY,timestamp_ms INTEGER)')
+        self.db.executemany('INSERT INTO observations VALUES(?,?)',[(r['observation_id'],r['timestamp_wall']) for r in rows])
     def history(self,event_id=None,start=0,end=2**63-1,limit=500,after_id=0,tail=False,before_id=2**63-1):
         rows=[copy.deepcopy(r) for r in self.rows if (event_id is None or r['event_id']==event_id)
             and start<=r['timestamp_wall']<=end and after_id<r['observation_id']<before_id]
@@ -63,7 +65,11 @@ class EvaluationTests(unittest.TestCase):
             other=sqlite3.connect(db.path)
             with self.assertRaises(sqlite3.IntegrityError):
                 other.execute('INSERT OR REPLACE INTO campaigns SELECT * FROM campaigns')
-            other.close();db.close();store.close()
+            other.close()
+            historical=dict(campaign(),evaluation_id='historical-fixture',mode='HISTORICAL')
+            db.register(historical)
+            self.assertIn('EXPLORATORY',report(tape,'historical-fixture')['status'])
+            db.close();store.close()
 
     def test_opening_freezes_features_and_excludes_same_raw_future_analyzers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -96,6 +102,8 @@ class EvaluationTests(unittest.TestCase):
             apparently_past=dict(row(29),timestamp_monotonic=32000000000)
             guarded=horizon_outcome(entry,apparently_past,{},NOW+30000,PROTOCOL)
             self.assertEqual(guarded['status'],'MISSING');self.assertIn('CLOCK_DISCONTINUITY',guarded['reason'])
+            self.assertEqual(EvidenceReader(reader).first_frame_in_range(NOW+29000,NOW+30000),30)
+            self.assertIsNone(EvidenceReader(reader).first_frame_in_range(NOW+32000,NOW+40000))
             recorder.close()
 
     def test_deferred_regime_next_open_holiday_dst_and_post_open_availability(self):
@@ -124,6 +132,10 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(data['unique_resolved_events'],4)
         self.assertEqual(data['curves']['pm_yes'][0]['predicted_mean'],.5)
         self.assertIsNone(data['curves']['pm_yes'][0]['uncertainty']['interval_95'])
+        resolutions[0]['resolution_timestamp']=NOW-1
+        late=calibration(forecasts,resolutions,PROTOCOL)
+        self.assertEqual(late['unique_resolved_events'],3)
+        self.assertEqual(late['exclusions']['RESOLVED_BEFORE_FORECAST'],1)
         market=dict(conditionId='c',outcomes='["Yes","No"]')
         response=dict(data=[dict(condition_id='c',status='resolved',price='1000000000000000000',last_update_timestamp='1759428779')])
         self.assertEqual(official_result(market,response)['yes'],1)
