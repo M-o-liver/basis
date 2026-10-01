@@ -1,5 +1,11 @@
 # Phase 1 acceptance record
 
+Operational update on 2026-10-01: [dated operational acceptance evidence](operational-acceptance-2026-10-01.md)
+adds bounded chronological verification, persisted continuity/source accounting,
+recovery exercises and explicit 24h/72h/7d gates. The earlier findings below remain
+unchanged. Historical unexplained recording gaps still fail elapsed historical
+gates; the newly instrumented campaign has not reached its duration gates.
+
 Update on 2026-09-28: extended research acceptance is still open. At the operator's
 subsequent request, experimental automated paper policies are now enabled, with
 versioned underlying theses, cost filters and loss feedback. Stock touch/terminal

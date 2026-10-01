@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import threading
@@ -23,6 +24,7 @@ class Store:
         if self.path != ':memory:':
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.checkpoint_errors = []
         self.db = sqlite3.connect(self.path, check_same_thread=False, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
@@ -99,15 +101,32 @@ class Store:
         self.db.execute('INSERT INTO checkpoints(raw_id,code_hash,sha256,data) VALUES(?,?,?,?)',
                         (raw_id, revision, hashlib.sha256(body).hexdigest(), zlib.compress(body, 1)))
 
-    def checkpoint(self, revision=None):
-        with self.lock:
-            row = self.db.execute('SELECT * FROM checkpoints WHERE (? IS NULL OR code_hash=?) ORDER BY id DESC LIMIT 1',(revision,revision)).fetchone()
-        if row is None:
-            return None
-        body = zlib.decompress(row['data'])
-        if hashlib.sha256(body).hexdigest() != row['sha256']:
-            raise ValueError('Restart checkpoint failed its content hash; use raw replay')
-        return dict(raw_id=row['raw_id'], code_hash=row['code_hash'], state=json.loads(body))
+    def checkpoint(self, revision=None, before_raw_id=None):
+        # An invalid newest checkpoint must not prevent committed raw-tape recovery.
+        # Keep the bad row and its evidence; bound fallback searches before raw replay.
+        before = 2**63-1
+        for _ in range(10):
+            with self.lock:
+                where = 'id<?' + (' AND code_hash=?' if revision else '')
+                params = (before, revision) if revision else (before,)
+                if before_raw_id is not None:
+                    where += ' AND raw_id<=?'
+                    params += (before_raw_id,)
+                row = self.db.execute(f'SELECT * FROM checkpoints WHERE {where} ORDER BY id DESC LIMIT 1', params).fetchone()
+            if row is None:
+                return None
+            before = row['id']
+            try:
+                body = zlib.decompress(row['data'])
+                if hashlib.sha256(body).hexdigest() != row['sha256']:
+                    raise ValueError('content hash mismatch')
+                return dict(raw_id=row['raw_id'], code_hash=row['code_hash'], state=json.loads(body))
+            except (zlib.error, ValueError, UnicodeError) as error:
+                failure = dict(checkpoint_id=row['id'], raw_id=row['raw_id'], error=str(error))
+                if failure not in self.checkpoint_errors:
+                    self.checkpoint_errors.append(failure)
+                logging.error('BASIS checkpoint unavailable; trying older checkpoint/raw tape: %s', failure)
+        return None
 
     def raw(self, after=0, until=None):
         # Keyset pages keep replay memory bounded and avoid a long-held read lock.

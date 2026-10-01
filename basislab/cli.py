@@ -115,6 +115,10 @@ def main():
     parser.add_argument('--db', default='data/basis.sqlite3')
     parser.add_argument('--url', default='http://127.0.0.1:8765')
     commands = parser.add_subparsers(dest='command', required=True)
+    acceptance = commands.add_parser('acceptance', help='Bounded persisted operational evidence; does not write the research tape')
+    acceptance.add_argument('--json', action='store_true')
+    acceptance.add_argument('--deep', action='store_true', help='Larger bounded replay sample; refresh integrity evidence when older than 24h')
+    acceptance.add_argument('--quick-check', action='store_true', help='Force full SQLite quick_check; explicit large-database scan')
     serving = commands.add_parser('serve'); serving.add_argument('--port', type=int, default=8765); serving.add_argument('--config'); serving.add_argument('--no-collect', action='store_true')
     commands.add_parser('watch'); commands.add_parser('status'); commands.add_parser('doctor')
     commands.add_parser('algos'); commands.add_parser('episodes')
@@ -135,6 +139,10 @@ def main():
     p=commands.add_parser('paper-replay');p.add_argument('plan');p.add_argument('--output',required=True)
     p=commands.add_parser('automation');p.add_argument('action',choices=('pause','resume'))
     args = parser.parse_args()
+    if args.command == 'acceptance':
+        from .acceptance import report, text_report
+        data = report(args.db, args.url, args.deep, args.quick_check)
+        print(json.dumps(data, indent=2) if args.json else text_report(data)); return
     if args.command == 'serve':
         serve(args.db, args.port, Config.load(args.config), not args.no_collect); return
     if args.command == 'watch': watch(args.url); return

@@ -22,8 +22,9 @@ def get_json(url):
 
 
 class Collector:
-    def __init__(self, engine):
+    def __init__(self, engine, monitor=None):
         self.engine = engine
+        self.monitor = monitor
         self.stop = threading.Event()
         self.refresh = threading.Event()
         self.thread = None
@@ -31,6 +32,7 @@ class Collector:
         self.equity_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='basis-equity')
         self.last_health = {}
         self.failed = None
+        self.failure_kind = None
 
     def start(self):
         self.thread = threading.Thread(target=self.run, name='basis-collector', daemon=True)
@@ -41,6 +43,7 @@ class Collector:
             asyncio.run(self.main())
         except BaseException as error:
             self.failed = str(error)
+            self.failure_kind = 'BASIS_COLLECTOR_FAILURE'
             logging.exception('BASIS collector stopped')
 
     def health(self, name, state, detail='', force=False):
@@ -239,10 +242,15 @@ class Collector:
                 free = shutil.disk_usage(self.engine.store.path).free / 1024**2
                 if free < self.engine.config.min_free_mb:
                     self.health('recorder', 'ERROR', 'Disk reserve reached; collection stopped', True)
-                    self.stop.set(); self.failed = 'Disk reserve reached'; return
+                    self.failed = 'Disk reserve reached'
+                    self.failure_kind = 'DISK_SAFETY_STOP'
+                    self.stop.set(); return
             self.engine.ingest('basis', 'timer', 'clock', dict(analyze=analyze))
             if now >= next_checkpoint:
-                self.engine.save_checkpoint()
+                if self.monitor:
+                    self.monitor.checkpoint()
+                else:
+                    self.engine.save_checkpoint()
                 next_checkpoint = now+300
             await self.sleep(5)
 

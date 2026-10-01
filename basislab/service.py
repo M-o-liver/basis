@@ -5,6 +5,7 @@ import mimetypes
 import os
 import fcntl
 import signal
+import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -15,6 +16,7 @@ from .replay import restore
 from .semantics import validate_mapping
 from .store import Store, encode
 from .paper import PaperDesk
+from .operations import Journal, RecorderMonitor
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -27,13 +29,23 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
         lock.close()
         raise RuntimeError('A BASIS service already owns this tape')
     store = Store(db)
+    journal = Journal(db)
+    journal.record('service_start', pid=os.getpid(), collect=collect)
+    if collect and not journal.latest('campaign_start'):
+        journal.record('campaign_start', pid=os.getpid(), reason='First instrumented production collector start; never reset by restart')
+    started = time.monotonic()
     engine = Engine(store, config or Config())
     requested_config = engine.config
     restore(engine)
+    journal.record('restore', pid=os.getpid(), seconds=time.monotonic()-started,
+                   raw_id=engine.last_raw_id, checkpoint_errors=store.checkpoint_errors)
     engine.config = requested_config
     engine.dynamics.config = engine.episodes.config = requested_config
     engine.start_session()
-    collector = Collector(engine)
+    journal.record('session_start', session=engine.session, raw_id=engine.last_raw_id,
+                   code_hash=engine.code_hash, pid=os.getpid(), collect=collect)
+    monitor = RecorderMonitor(engine, journal)
+    collector = Collector(engine, monitor)
     paper = PaperDesk(engine, Path(db).with_suffix('.paper.sqlite3'))
     paper.start()
 
@@ -56,7 +68,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
             path = urlparse(self.path); q = parse_qs(path.query,keep_blank_values=True)
             try:
                 if path.path == '/api/state':
-                    data = engine.snapshot(); data.pop('catalog', None); data['collector'] = dict(running=bool(collector.thread and collector.thread.is_alive()), failure=collector.failed)
+                    data = engine.snapshot(); data.pop('catalog', None); data['collector'] = dict(running=bool(collector.thread and collector.thread.is_alive() and not engine.persistence_error), failure=collector.failed or engine.persistence_error)
                     data['phase2']=dict(enabled=True,mode='experimental_paper',automated_policies=True,research_acceptance='open',reason='Versioned diagnostic policies and manual paper; no real orders')
                     self.send(200, data)
                 elif path.path == '/api/wallets':
@@ -85,7 +97,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                     with engine.lock:
                         self.send(200, dict(rows=list(engine.catalog.values())))
                 elif path.path == '/api/health':
-                    self.send(200, dict(ok=not collector.failed, collecting=bool(collector.thread and collector.thread.is_alive()), versions=engine.snapshot()['versions']))
+                    self.send(200, dict(ok=not (collector.failed or engine.persistence_error), collecting=bool(collector.thread and collector.thread.is_alive() and not engine.persistence_error), versions=engine.snapshot()['versions']))
                 elif path.path == '/api/replay':
                     self.send(200, dict(rows=store.history(q.get('event_id', [None])[0], int(q.get('from', [0])[0]), int(q.get('to', [2**63-1])[0]), int(q.get('limit', [500])[0]), int(q.get('after', [0])[0]), q.get('tail', ['0'])[0] == '1', int(q.get('before', [2**63-1])[0])),global_count=store.research_count('replay'),empty_reason='No recorded observations in this scope/page.'))
                 elif path.path == '/api/raw':
@@ -155,7 +167,18 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                 logging.exception('BASIS POST %s failed',self.path)
                 self.send(500,dict(error=str(error),code='INTERNAL_ERROR'))
 
-    httpd = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    class RecorderServer(ThreadingHTTPServer):
+        def service_actions(self):
+            # A live HTTP process is not proof of a live recorder. Exit so the
+            # supervisor can recover, rather than leaving a dead collector online.
+            if collector.failed or engine.persistence_error:
+                raise RuntimeError(collector.failed or engine.persistence_error)
+            if collect and collector.thread and not collector.thread.is_alive():
+                collector.failure_kind = 'BASIS_COLLECTOR_FAILURE'
+                raise RuntimeError('Collector exited without a healthy recording loop')
+            monitor.sample()
+
+    httpd = RecorderServer(('127.0.0.1', port), Handler)
     if collect:
         collector.start()
     print(f'BASIS research terminal: http://127.0.0.1:{port} | tape {db}', flush=True)
@@ -163,11 +186,17 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
         def terminate(signum, frame):
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, terminate)
+    shutdown_reason = 'UNKNOWN_STOP'
     try:
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
-        pass
+        shutdown_reason = 'CONTROLLED_RESTART'
     finally:
+        reason = collector.failure_kind or ('BASIS_COLLECTOR_FAILURE' if engine.persistence_error else shutdown_reason)
+        journal.record('service_stop', session=engine.session, raw_id=engine.last_raw_id, pid=os.getpid(),
+                       reason=reason, error=collector.failed or engine.persistence_error,
+                       min_free_mb=engine.config.min_free_mb)
         httpd.server_close(); paper.close(); collector.close()
-        engine.save_checkpoint()
-        store.close(); lock.close()
+        monitor.checkpoint()
+        journal.record('service_stopped', session=engine.session, raw_id=engine.last_raw_id, reason=reason)
+        store.close(); journal.close(); lock.close()

@@ -31,6 +31,10 @@ Open **http://127.0.0.1:8765/** or run `./basis watch` in another terminal. The 
 ```sh
 ./basis status
 ./basis doctor
+./basis acceptance
+./basis acceptance --json
+./basis acceptance --deep
+./basis acceptance --deep --quick-check
 ./basis replay ETH-2300
 ./basis replay <event_id> --from 2026-09-26T19:00:00Z --to 2026-09-26T19:05:00Z
 ./basis replay <gap_event_id>
@@ -53,7 +57,24 @@ nohup ./basis supervise >>data/collector.log 2>&1 &
 echo $! >data/collector.pid
 ```
 
-Stop that process with SIGTERM; shutdown commits a checkpoint. The userland supervisor restarts an exited collector with bounded backoff and logs child exit status. It cannot restart itself after a machine reboot or diagnose every hung process. No system service or machine configuration is installed. Check `./basis doctor` after restart. Extended unattended validation remains an acceptance gate.
+Stop that process with SIGTERM; shutdown commits a checkpoint. The userland supervisor restarts an exited collector with bounded backoff and journals child exit status. A failed collector or persistence failure also stops the HTTP process so recovery can occur. A disk-safety stop waits for the configured reserve to become available, preserving all history. Invalid checkpoints remain recorded while startup tries older checkpoints and then raw replay. The supervisor cannot restart itself after a machine reboot or diagnose every hung process. No system service or machine configuration is installed.
+
+`acceptance` opens the research tape read-only and keeps operational evidence in
+`<tape>.acceptance.sqlite3`. It reports recording chronology, historical source
+health, resource measurements, checkpoint/recovery evidence and sampled replay.
+Normal replay has a 25-second/70,000-record budget. A first marker projection is
+incremental and may need another run to finish; incomplete coverage is explicit.
+`--deep` expands replay to 180 seconds/400,000 records and refreshes SQLite
+quick_check evidence if none exists or it is older than 24 hours. `--quick-check`
+forces that full scan, which can take tens of minutes on a large tape and
+temporarily grow its WAL. Routine reports show the dated integrity result and
+its raw boundary. Unverified replay regions never count as matches.
+
+The 24-hour, 72-hour and 7-day gates count timer-covered recording time in a
+campaign that starts once at the first instrumented service start. Older
+interruptions and historical gates remain visible. See the
+[operational acceptance record](docs/operational-acceptance-2026-10-01.md) for
+criteria, measured evidence and remaining limits. Extended acceptance remains open.
 
 ## Controls
 
