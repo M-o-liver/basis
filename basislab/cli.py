@@ -11,6 +11,7 @@ from .replay import verify_replay
 from .semantics import timestamp
 from .service import serve
 from .store import Store, encode
+from .tape import open_store
 
 
 def fetch(base, path):
@@ -117,8 +118,12 @@ def main():
     commands = parser.add_subparsers(dest='command', required=True)
     acceptance = commands.add_parser('acceptance', help='Bounded persisted operational evidence; does not write the research tape')
     acceptance.add_argument('--json', action='store_true')
-    acceptance.add_argument('--deep', action='store_true', help='Larger bounded replay sample; refresh integrity evidence when older than 24h')
-    acceptance.add_argument('--quick-check', action='store_true', help='Force full SQLite quick_check; explicit large-database scan')
+    acceptance.add_argument('--deep', action='store_true', help='Larger bounded replay sample; does not rescan frozen legacy data')
+    acceptance.add_argument('--quick-check', action='store_true', help='Explicit full v1 SQLite scan; v2 checks its small active segment and reuses closed integrity evidence')
+    shadow=commands.add_parser('storage-shadow',help='30–120 minute lossless v2 validation on the existing committed source stream')
+    shadow.add_argument('--output',required=True);shadow.add_argument('--minutes',type=float,default=30)
+    cutover_parser=commands.add_parser('storage-cutover',help='Initialize validated v2 storage while the legacy writer is stopped; never rewrites history')
+    cutover_parser.add_argument('--tape-dir',default='data/tape');cutover_parser.add_argument('--validation',required=True)
     serving = commands.add_parser('serve'); serving.add_argument('--port', type=int, default=8765); serving.add_argument('--config'); serving.add_argument('--no-collect', action='store_true')
     commands.add_parser('watch'); commands.add_parser('status'); commands.add_parser('doctor')
     commands.add_parser('algos'); commands.add_parser('episodes')
@@ -139,6 +144,14 @@ def main():
     p=commands.add_parser('paper-replay');p.add_argument('plan');p.add_argument('--output',required=True)
     p=commands.add_parser('automation');p.add_argument('action',choices=('pause','resume'))
     args = parser.parse_args()
+    if args.command=='storage-shadow':
+        from .storage_shadow import run_shadow
+        result=run_shadow(args.db,args.output,args.minutes);print(json.dumps(result,indent=2))
+        if not result['accepted']:raise SystemExit(1)
+        return
+    if args.command=='storage-cutover':
+        from .storage_cutover import cutover
+        print(json.dumps(cutover(args.db,args.tape_dir,args.validation),indent=2));return
     if args.command == 'acceptance':
         from .acceptance import report, text_report
         data = report(args.db, args.url, args.deep, args.quick_check)
@@ -187,12 +200,12 @@ def main():
         data = fetch(args.url, '/api/state')
         print(json.dumps({k: data[k] for k in ('sources', 'stats', 'diagnostics', 'collector', 'versions', 'phase2')}, indent=2))
         if args.command == 'doctor':
-            store = Store(args.db)
+            store = open_store(args.db,read_only=True)
             try:
-                with store.lock: print('sqlite_quick_check:', store.db.execute('PRAGMA quick_check').fetchone()[0])
+                with store.lock: print('sqlite_quick_check:',store.integrity() if hasattr(store,'integrity') else store.db.execute('PRAGMA quick_check').fetchone()[0])
             finally: store.close()
         return
-    store = Store(args.db)
+    store = open_store(args.db,read_only=True)
     try:
         if args.command == 'raw': print(json.dumps(store.raw_record(args.id), indent=2)); return
         if args.command == 'algos': print(json.dumps(store.latest('analyzers', 'scope,algo_name', 1000), indent=2)); return

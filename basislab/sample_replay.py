@@ -13,6 +13,12 @@ from .store import Store, encode, decode
 
 
 class ReadTape(Store):
+    def __new__(cls,path):
+        if Path(str(Path(path).resolve())+'.storage.json').exists():
+            from .tape import open_store
+            return open_store(path,read_only=True)
+        return super().__new__(cls)
+
     def __init__(self, path):
         self.path = str(path)
         self.lock = threading.RLock()
@@ -103,8 +109,12 @@ def sampled_replay(tape, regions, checkpoints, deep=False):
         details.append(detail)
         if time.monotonic()-started >= seconds_budget or raw_count >= raw_budget:
             detail['reason'] = 'REPLAY_BUDGET_REACHED'; continue
-        first = tape.db.execute('SELECT raw_id,data FROM observations WHERE raw_id>=? AND raw_id<=? ORDER BY raw_id,id LIMIT 1',
-                                (region['start'], region['end'])).fetchone()
+        if hasattr(tape,'observations_in_range'):
+            candidates=tape.observations_in_range(region['start'],region['end'],1)
+            first=candidates[0] if candidates else None
+        else:
+            first = tape.db.execute('SELECT raw_id,data FROM observations WHERE raw_id>=? AND raw_id<=? ORDER BY raw_id,id LIMIT 1',
+                                    (region['start'], region['end'])).fetchone()
         if not first:
             detail['reason'] = 'NO_OBSERVATIONS_IN_REGION'; continue
         revision = decode(first['data']).get('code_hash')
@@ -126,7 +136,7 @@ def sampled_replay(tape, regions, checkpoints, deep=False):
                 eligible.append(cp)
         after = 0
         for cp in eligible[:10]:
-            row = tape.db.execute('SELECT sha256,data FROM checkpoints WHERE id=?', (cp['id'],)).fetchone()
+            row = tape.checkpoint_record(cp['id']) if hasattr(tape,'checkpoint_record') else tape.db.execute('SELECT sha256,data FROM checkpoints WHERE id=?', (cp['id'],)).fetchone()
             try:
                 body = zlib.decompress(row['data'])
                 if hashlib.sha256(body).hexdigest()!=row['sha256']:
@@ -149,9 +159,8 @@ def sampled_replay(tape, regions, checkpoints, deep=False):
                 raw_count += 1; detail['raw_records'] += 1
                 if record['id'] < region['start']:
                     continue
-                rows = tape.db.execute('SELECT data FROM observations WHERE raw_id=? ORDER BY id', (record['id'],)).fetchall()
-                for row in rows:
-                    expected = decode(row['data'])
+                rows = tape.frames_at(record['id']) if hasattr(tape,'frames_at') else [decode(r['data']) for r in tape.db.execute('SELECT data FROM observations WHERE raw_id=? ORDER BY id', (record['id'],))]
+                for expected in rows:
                     if expected.get('code_hash')!=revision:
                         detail['reason'] = 'VERSION_BOUNDARY_REQUIRES_ANOTHER_REGION'; continue
                     checked += 1; detail['observations'] += 1

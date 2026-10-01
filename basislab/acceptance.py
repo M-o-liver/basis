@@ -10,7 +10,7 @@ import sqlite3
 import time
 import urllib.request
 import zlib
-from .operations import Journal
+from .operations import Journal, resources
 from .sample_replay import ReadTape, choose_regions, sampled_replay
 from .store import decode, encode
 
@@ -26,7 +26,9 @@ CRITERIA = dict(version='operational-v1', timer_seconds=5, timer_gap_seconds=30,
 
 def project_markers(tape, journal):
     """Incremental indexed projection; all rows keep their immutable raw hash/ID."""
-    first = tape.db.execute('SELECT sha256 FROM raw ORDER BY id LIMIT 1').fetchone()
+    segmented=hasattr(tape,'marker_records')
+    first_record=tape.raw_record(1) if segmented else None
+    first = (first_record['sha256'],) if first_record else (None if segmented else tape.db.execute('SELECT sha256 FROM raw ORDER BY id LIMIT 1').fetchone())
     identity = dict(tape=str(Path(tape.path).resolve()), first_raw_hash=first[0] if first else None)
     prior = journal.latest('tape_identity')
     if prior and any(prior.get(k)!=v for k,v in identity.items()):
@@ -40,19 +42,24 @@ def project_markers(tape, journal):
         after = mark[0] if mark else 0
         # timer has a fixed subject and benefits from the existing covering index.
         subject = " AND subject='clock'" if kind=='timer' else ''
-        cursor = tape.db.execute(f'SELECT id,received_ms,kind,subject,session,sha256,payload FROM raw WHERE kind=?{subject} AND id>? AND id<=? ORDER BY id',
+        cursor = tape.marker_records(kind,after,tape.boundary) if segmented else tape.db.execute(f'SELECT id,received_ms,kind,subject,session,sha256,payload FROM raw WHERE kind=?{subject} AND id>? AND id<=? ORDER BY id',
                                  (kind, after, tape.boundary))
         try:
             while True:
-                rows = cursor.fetchmany(2000)
+                if segmented:
+                    import itertools
+                    rows=list(itertools.islice(cursor,2000))
+                else:rows = cursor.fetchmany(2000)
                 if not rows:
                     break
                 values = []
                 for r in rows:
-                    body = zlib.decompress(r['payload'])
-                    if hashlib.sha256(body).hexdigest()!=r['sha256']:
-                        raise ValueError(f'Operational marker raw hash mismatch at {r["id"]}')
-                    payload = decode(r['payload'])
+                    if segmented:payload=r['payload']  # The tape reader already verifies the logical hash.
+                    else:
+                        body = zlib.decompress(r['payload'])
+                        if hashlib.sha256(body).hexdigest()!=r['sha256']:
+                            raise ValueError(f'Operational marker raw hash mismatch at {r["id"]}')
+                        payload = decode(r['payload'])
                     if kind=='session':
                         payload = {k:payload[k] for k in ('config','code_hash','parameter_hash','checkpoint_migration') if k in payload}
                     elif kind=='timer':
@@ -69,7 +76,7 @@ def project_markers(tape, journal):
                 if time.monotonic()>deadline:
                     complete = False; break
         finally:
-            cursor.close()
+            if hasattr(cursor,'close'):cursor.close()
         if not complete:
             break
     return complete
@@ -181,6 +188,7 @@ def gate_status(hours, recorded_seconds, gaps, replay, integrity, recovery_compl
 def report(path, url='http://127.0.0.1:8765', deep=False, quick_check=False):
     started=time.monotonic(); now=time.time_ns()//1_000_000
     tape=ReadTape(path); journal=Journal(path)
+    segmented=hasattr(tape,'marker_records')
     try:
         complete=project_markers(tape,journal)
         session_rows=markers(journal,'session',tape.boundary)
@@ -198,13 +206,13 @@ def report(path, url='http://127.0.0.1:8765', deep=False, quick_check=False):
         for gap in continuity['gaps']:
             span=gap['after_raw_id']-gap['before_raw_id']
             if span<=25_000:
-                rows=tape.db.execute('SELECT received_ms FROM raw WHERE id BETWEEN ? AND ? ORDER BY id',
+                rows=[(r['received_ms'],) for r in tape.between(gap['before_raw_id']-1,gap['after_raw_id'])] if segmented else tape.db.execute('SELECT received_ms FROM raw WHERE id BETWEEN ? AND ? ORDER BY id',
                                      (gap['before_raw_id'],gap['after_raw_id'])).fetchall()
                 gap['longest_all_recording_gap_seconds']=max((max(0,(b[0]-a[0])/1000) for a,b in zip(rows,rows[1:])),default=0)
             else:
                 gap['all_feed_gap_reason']='Raw neighborhood exceeds bounded inspection budget'
         source_health,transitions=source_accounting(health_rows,continuity['segments'],session_rows)
-        checkpoints=[dict(r) for r in tape.db.execute('SELECT id,raw_id,code_hash FROM checkpoints WHERE raw_id<=? ORDER BY id',(tape.boundary,))]
+        checkpoints=[r for r in tape.checkpoint_metadata() if r['raw_id']<=tape.boundary] if segmented else [dict(r) for r in tape.db.execute('SELECT id,raw_id,code_hash FROM checkpoints WHERE raw_id<=? ORDER BY id',(tape.boundary,))]
         quarantine=list({q['raw_id']:q for q in journal.entries('quarantine')}.values())
         checkpoint=tape.checkpoint(before_raw_id=tape.boundary)
         counters=checkpoint['state'] if checkpoint else {}
@@ -213,32 +221,56 @@ def report(path, url='http://127.0.0.1:8765', deep=False, quick_check=False):
             if error['raw_id'] not in known:
                 journal.record('quarantine',**error);quarantine.append(error);known.add(error['raw_id'])
         regions=choose_regions(tape.boundary,session_rows,checkpoints,transitions,quarantine,deep)
+        if segmented:
+            legacy_boundary=(tape.manifest.get('legacy') or {}).get('limits',{}).get('raw',0)
+            # Native tick density can put 64 raw records inside one frame
+            # interval. Sample a wider causal suffix, still bounded by the
+            # captured prefix, rather than reporting an empty latest region.
+            for region in regions:
+                if 'latest' in region['reasons'] and region['start']>legacy_boundary:
+                    region['start']=max(legacy_boundary+1,tape.boundary-1023)
+            for item in tape.manifest['segments']:
+                start=item['base']['raw']+1
+                if start<=tape.boundary:regions.append(dict(start=start,end=min(start+1023,tape.boundary),anchor=start,reasons=['storage-segment-boundary']))
         replay=sampled_replay(tape,regions,checkpoints,deep)
         journal.record('sample_replay',**replay)
         if deep:
             journal.record('sample_replay_deep',**replay)
         integrity=journal.latest('integrity')
-        if quick_check or (deep and (not integrity or integrity.get('result')!='ok' or now-integrity['timestamp_ms']>86400_000)):
+        if segmented:
+            legacy_integrity=integrity
+            integrity=tape.integrity()
+            integrity['legacy_dated_evidence']=legacy_integrity
+            journal.record('integrity_v2',**integrity)
+        elif quick_check:
             t=time.monotonic()
             rows=[r[0] for r in tape.db.execute('PRAGMA quick_check')]
             integrity=dict(result='ok' if rows==['ok'] else 'FAIL',messages=rows,raw_boundary=tape.boundary,seconds=time.monotonic()-t)
             journal.record('integrity',**integrity);integrity=journal.latest('integrity')
-        integrity=integrity or dict(result='NOT CHECKED',reason='Run acceptance --deep for full SQLite quick_check; ordinary reports reuse dated evidence.')
+        integrity=integrity or dict(result='NOT CHECKED',reason='Run acceptance --quick-check for an explicit full v1 SQLite scan; --deep only expands replay sampling.')
         integrity['age_seconds']=max(0,(time.time_ns()//1_000_000-integrity['timestamp_ms'])/1000) if integrity.get('timestamp_ms') else None
-        integrity['fresh']=integrity['age_seconds'] is not None and integrity['age_seconds']<=86400
+        if not segmented:integrity['fresh']=integrity['age_seconds'] is not None and integrity['age_seconds']<=86400
         latest_cp=checkpoints[-1] if checkpoints else None
-        latest_cp_ms=tape.db.execute('SELECT received_ms FROM raw WHERE id=?',(latest_cp['raw_id'],)).fetchone()[0] if latest_cp else None
+        latest_cp_ms=(tape.raw_record(latest_cp['raw_id'])['received_ms'] if segmented else tape.db.execute('SELECT received_ms FROM raw WHERE id=?',(latest_cp['raw_id'],)).fetchone()[0]) if latest_cp else None
         # These counters survive restarts in checkpoints. The old error deque is
         # explicitly a lower bound, not a fabricated historical packet census.
         # MAX primary keys are exact counts under BASIS's dense, append-only invariant.
         totals=tape.counts
-        last=tape.db.execute('SELECT received_ms,session FROM raw WHERE id=?',(tape.boundary,)).fetchone()
-        first=tape.db.execute('SELECT received_ms FROM raw ORDER BY id LIMIT 1').fetchone()
+        last_record=tape.raw_record(tape.boundary) if segmented else None
+        first_record=tape.raw_record(1) if segmented else None
+        if segmented:
+            last=(last_record['received_ms'],last_record['session']) if last_record else None
+            first=(first_record['received_ms'],) if first_record else None
+        else:
+            last=tape.db.execute('SELECT received_ms,session FROM raw WHERE id=?',(tape.boundary,)).fetchone()
+            first=tape.db.execute('SELECT received_ms FROM raw ORDER BY id LIMIT 1').fetchone()
         samples=journal.entries('resource')
         current=samples[-1] if samples else {}
         growth=None; cpu=None;growth_window=None;cpu_window=None
         logical=[s for s in samples if 'logical_database_bytes' in s]
         growth_samples=logical if len(logical)>1 else samples
+        if current.get('storage_version')==2:
+            growth_samples=[s for s in growth_samples if s.get('storage_version')==2]
         growth_field='logical_database_bytes' if len(logical)>1 else 'database_bytes'
         if len(growth_samples)>1:
             end_sample=growth_samples[-1]
@@ -262,7 +294,10 @@ def report(path, url='http://127.0.0.1:8765', deep=False, quick_check=False):
         except (OSError,ValueError) as error:
             live_error=str(error)
         current_time=time.time_ns()//1_000_000
-        row=tape.db.execute("SELECT received_ms FROM raw WHERE kind='timer' AND subject='clock' ORDER BY id DESC LIMIT 1").fetchone()
+        if segmented:
+            last_timer_record=next(reversed(timer_rows),None)
+            row=(last_timer_record['timestamp_ms'],) if last_timer_record else None
+        else:row=tape.db.execute("SELECT received_ms FROM raw WHERE kind='timer' AND subject='clock' ORDER BY id DESC LIMIT 1").fetchone()
         last_timer=row[0] if row else None
         recent=last_timer is not None and 0<=current_time-last_timer<=30_000
         collector_state='RECORDING' if recent else 'STALE_OR_STOPPED'
@@ -277,11 +312,14 @@ def report(path, url='http://127.0.0.1:8765', deep=False, quick_check=False):
             for p in ('graceful_restart','supervisor_recovery','checkpoint_fallback','write_failure','duplicate_lock','disk_safety'))
         gates={str(h)+'h':gate_status(h,campaign_seconds,campaign_gaps,replay,integrity,recovery_complete) for h in (24,72,168)}
         historical_gates={str(h)+'h':gate_status(h,continuity['recorded_seconds'],continuity['gaps'],replay,integrity,recovery_complete) for h in (24,72,168)}
-        result=dict(acceptance_version='operational-v1',timestamp_ms=current_time,snapshot_started_ms=now,code_hash=live.get('versions',{}).get('code_hash') if live else None,
-            criteria=CRITERIA,collector=dict(state=collector_state,current_uptime_seconds=live.get('diagnostics',{}).get('uptime_seconds') if live else None,
+        criteria=dict(CRITERIA)
+        if segmented:criteria.update(version='operational-v2',integrity='Closed v2 segments checked/hash-recorded once; unchanged immutable files reuse that evidence. Small active segment checked now. Frozen v1 retains dated evidence separately; no daily live monolith rescan.')
+        size=resources(path)
+        result=dict(acceptance_version=criteria['version'],timestamp_ms=current_time,snapshot_started_ms=now,code_hash=live.get('versions',{}).get('code_hash') if live else None,
+            criteria=criteria,collector=dict(state=collector_state,current_uptime_seconds=live.get('diagnostics',{}).get('uptime_seconds') if live else None,
                 last_committed_raw_ms=last[0] if last else None,last_timer_ms=last_timer,api_error=live_error,live=live.get('collector') if live else None),
             tape=dict(path=str(Path(path).resolve()),raw_boundary=tape.boundary,first_received_ms=first[0] if first else None,
-                database_bytes=Path(path).stat().st_size,wal_bytes=Path(str(path)+'-wal').stat().st_size if Path(str(path)+'-wal').exists() else 0,
+                database_bytes=size['database_bytes'],wal_bytes=size['wal_bytes'],storage_version=2 if segmented else 1,
                 free_bytes=shutil.disk_usage(Path(path).parent).free,growth_bytes_per_hour=growth,counts=totals),
             chronology=continuity,source_health=source_health,marker_projection_complete=complete,
             packets=dict(delayed=current.get('delayed_packets',counters.get('delayed_packets')),clock_errors=current.get('clock_errors',counters.get('clock_errors')),
@@ -346,7 +384,8 @@ def text_report(data):
         if values:
             durations=[r['seconds'] for r in values]
             lines.append(f"{kind} last={durations[-1]:.3f}s range={min(durations):.3f}-{max(durations):.3f}s ({len(values)} samples)")
-    lines += ['Criteria operational-v1: exclude unrecorded time; >60s interruption fails an elapsed gate; integrity <=24h; incomplete replay/recovery is PARTIAL.',
+    lines += [f"Criteria {data['criteria']['version']}: exclude unrecorded time; >60s interruption fails an elapsed gate; incomplete replay/recovery is PARTIAL.",
+        data['criteria'].get('integrity','V1 integrity evidence must be <=24h; full scans are explicit operator actions.'),
         'Source outages alone do not fail recorder acceptance. Historical failures remain visible.',
         f"Report {data['report_seconds']:.2f}s; evidence in {tape['path']}.acceptance.sqlite3; --json includes full provenance."]
     return '\n'.join(lines)

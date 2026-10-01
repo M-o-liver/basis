@@ -54,6 +54,15 @@ def resources(tape):
     usage = resource.getrusage(resource.RUSAGE_SELF)
     sizes = {name: Path(str(tape) + suffix).stat().st_size if Path(str(tape) + suffix).exists() else 0
              for name, suffix in (('database_bytes', ''), ('wal_bytes', '-wal'))}
+    pointer=Path(str(Path(tape).resolve())+'.storage.json')
+    if pointer.exists():
+        import json
+        manifest=Path(json.loads(pointer.read_text())['manifest']);value=json.loads(manifest.read_text())
+        for segment in value['segments']:
+            path=manifest.parent/segment['file']
+            sizes['database_bytes']+=path.stat().st_size
+            if Path(str(path)+'-wal').exists():sizes['wal_bytes']+=Path(str(path)+'-wal').stat().st_size
+        sizes.update(storage_version=2,active_segment=value['segments'][-1]['file'])
     rss = None
     try:
         rss = int(Path('/proc/self/statm').read_text().split()[1]) * os.sysconf('SC_PAGE_SIZE')
@@ -81,8 +90,7 @@ class RecorderMonitor:
             # Main-file growth can pause behind a WAL reader. SQLite's logical
             # page count includes committed growth still residing in the WAL.
             with self.engine.store.lock:
-                db=self.engine.store.db
-                data['logical_database_bytes']=db.execute('PRAGMA page_count').fetchone()[0]*db.execute('PRAGMA page_size').fetchone()[0]
+                data['logical_database_bytes']=self.engine.store.logical_bytes()
             retained_errors=set()
             for error in self.engine.errors:
                 key = encode(error)

@@ -5,6 +5,7 @@ from .engine import Engine
 from .paper import PaperDesk
 from .semantics import timestamp
 from .store import Store
+from .tape import open_store
 
 
 def replay_orders(tape,plan_path,output_path):
@@ -15,7 +16,7 @@ def replay_orders(tape,plan_path,output_path):
         order['decision_ms']=timestamp(order.get('timestamp'))
         if order['decision_ms'] is None:raise ValueError('Each decision requires an explicit UTC timestamp')
     plan.sort(key=lambda o:o['decision_ms'])
-    store=Store(tape);engine=Engine(store,persist=False);engine.restoring=True
+    store=open_store(tape,read_only=True);engine=Engine(store,persist=False);engine.restoring=True
     clock=[store.stats()['first_received_ms'] or 0]
     desk=PaperDesk(engine,output_path,clock=lambda:clock[0],auto_policies=False);index=0;rejected=[]
     try:

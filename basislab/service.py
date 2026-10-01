@@ -15,12 +15,14 @@ from .engine import Engine
 from .replay import restore
 from .semantics import validate_mapping
 from .store import Store, encode
+from .tape import open_store
 from .paper import PaperDesk
 from .operations import Journal, RecorderMonitor
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
+    db=str(Path(db).resolve())
     Path(db).parent.mkdir(parents=True, exist_ok=True)
     lock = open(str(db) + '.collector.lock', 'a')
     try:
@@ -28,7 +30,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
     except BlockingIOError:
         lock.close()
         raise RuntimeError('A BASIS service already owns this tape')
-    store = Store(db)
+    store = open_store(db)
     journal = Journal(db)
     journal.record('service_start', pid=os.getpid(), collect=collect)
     if collect and not journal.latest('campaign_start'):
@@ -41,6 +43,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                    raw_id=engine.last_raw_id, checkpoint_errors=store.checkpoint_errors)
     engine.config = requested_config
     engine.dynamics.config = engine.episodes.config = requested_config
+    if hasattr(store,'resume'):store.resume(engine)
     engine.start_session()
     journal.record('session_start', session=engine.session, raw_id=engine.last_raw_id,
                    code_hash=engine.code_hash, pid=os.getpid(), collect=collect)

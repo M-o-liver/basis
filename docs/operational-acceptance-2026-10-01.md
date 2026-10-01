@@ -272,3 +272,25 @@ The remaining evidence is **PARTIAL**: early raw-boundary warm-up beyond the
 verification budgets, exact historical quarantine totals, every-packet capture,
 indefinite-hang/machine-reboot recovery, and longer resource behavior. The
 extended duration gates have not been claimed early.
+
+
+## Storage cutover follow-up, October 1
+
+The later [storage profile and v2 acceptance](storage-profile-2026-10-01.md)
+retains this earlier evidence and records a further legacy stall/recovery,
+exact live shadow and preserving cutover. The 30-minute shadow measured
+**115.5 MiB/hour versus 1.457 GiB/hour** on the same stream; production's
+initial post-seed steady window measured **144.3 MiB/hour**. Legacy, wallet
+runs, scientific campaign and unexplained gaps were not reset.
+
+Integrity policy **operational-v2** checks/hashes immutable closed segments once,
+reuses unchanged closed-file evidence, and routinely checks only the small active
+segment. Frozen v1 retains the dated 58-minute result and checked prefix. `--deep`
+only expands sampling; explicit legacy `--quick-check` requests a full scan.
+
+Latest report: **9/33 regions**, **3,022 observations**, zero mismatches/missing
+reducers; active quick_check **0.203s**. Skipped regions remain unverified.
+Campaign 24h/72h/7d **NOT YET ELAPSED**; historical 24h/72h **FAIL** retained.
+No multi-day unattended acceptance is claimed by this storage migration.
+
+The later **31.794-minute** production observation measured **137.009 MiB/hour** after the one-time seed (**10.89×**). Startup-inclusive average **154.368 MiB/hour** is retained explicitly; no multi-day gate changed.

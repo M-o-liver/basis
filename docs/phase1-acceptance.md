@@ -1,5 +1,35 @@
 # Phase 1 acceptance record
 
+Options incident on 2026-10-01, verified live at 19:37 UTC: the monitor initially
+had 3/60 conventional probabilities and no daily ETH terminal events. The generic
+catalog scan omitted that family; explicitly acquiring existing current/next-day
+BTC/ETH event slugs, including the year, restored 11 BTC and 11 ETH probabilities.
+The real Chrome terminal displayed ETH and BTC PM/OPT/GAP rows after deployment.
+
+All six currently monitored Yahoo symbols previously lost their chains to
+`DateOutOfBounds`: the exchange calendar's default ended in October 2027, before
+listed December 2027 and 2029 LEAPS. Calendars now cover the requested year, chain
+failures are isolated, and acquisition retains the nearest actual post-event
+expiry even outside the probability model's window. All six feeds subsequently
+reported OK with real calls/puts; the AAPL instrument API returned 25 selectable
+instruments with no exclusions during the open session. October stock and crypto
+touch events remain CUTOFF when the closest listed expiry exceeds the unchanged
+72-hour model tolerance. Acquisition success does not establish semantic or
+expiry equivalence, and Yahoo quotes remain delayed proxies.
+
+The supervised child restarted gracefully (3295483 → 3306939), exactly one child
+remained, committed recording continued, and all wallet/run IDs were retained.
+The frozen legacy tape's size and mtime were unchanged. Probability, feature,
+config and reducer versions are unchanged; adapter source archive is
+`252261789b068fcea68d`, code commit `3968a23`. Three focused regressions cover
+future listed expiries, chain outage isolation/strict model cutoff, and daily
+catalog discovery/year rollover. The full suite passed 77 tests. Ignored local
+evidence: `data/options-screen-before.json`, `data/options-restart-before.json`,
+and `data/options-screen-after.json`. This incident does not pass duration gates
+or erase any earlier findings below.
+
+Storage update on 2026-10-01: [measured storage profile, exact replay and preserving v2 cutover](storage-profile-2026-10-01.md). This retains old failures and does not pass future duration gates.
+
 Operational update on 2026-10-01: [dated operational acceptance evidence](operational-acceptance-2026-10-01.md)
 adds bounded chronological verification, persisted continuity/source accounting,
 recovery exercises and explicit 24h/72h/7d gates. The earlier findings below remain
