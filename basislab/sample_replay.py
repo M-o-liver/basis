@@ -48,6 +48,11 @@ def choose_regions(boundary, sessions, checkpoints, transitions=(), quarantines=
         anchors.setdefault(raw_id, []).append(reason)
     if not boundary:
         return []
+    # Metadata arriving after the captured prefix must not alter its sample plan.
+    sessions=[s for s in sessions if s['raw_id']<=boundary]
+    checkpoints=[c for c in checkpoints if c['raw_id']<boundary]
+    transitions=[t for t in transitions if t['raw_id']<=boundary]
+    quarantines=[q for q in quarantines if q['raw_id']<=boundary]
     add(1, 'earliest/crypto-era')
     add(max(1, boundary-63), 'latest')
     # Middle/checkpoint windows deliberately start just after a causal checkpoint.

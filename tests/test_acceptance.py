@@ -21,6 +21,9 @@ class AcceptanceTests(unittest.TestCase):
             cps=[dict(r) for r in store.db.execute('SELECT id,raw_id,code_hash FROM checkpoints')]
             regions=choose_regions(boundary,[],cps)
             self.assertEqual(regions,choose_regions(boundary,[],cps))
+            self.assertEqual(regions,choose_regions(boundary,[],[]))
+            self.assertEqual(regions,choose_regions(boundary,[],cps,
+                [dict(raw_id=boundary+1,reason='future-transition')],[dict(raw_id=boundary+1)]))
             self.assertTrue(all(r['end']<=boundary for r in regions))
             split=choose_regions(100,[dict(raw_id=1,data=dict(code_hash='a')),dict(raw_id=50,data=dict(code_hash='b'))],[],
                                  [dict(raw_id=52,reason='source-ERROR-OK-transition')])

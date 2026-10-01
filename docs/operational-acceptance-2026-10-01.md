@@ -233,3 +233,42 @@ Production disk space and production data were not altered for that exercise.
 
 The full production integrity scan is still running at this update. Its result
 is not inferred from the successful sampled replay.
+
+## Completed integrity and current observation — 12:50 UTC
+
+The full production **SQLite quick_check returned `ok`** at **12:43:59 UTC**.
+It took **3,505.39 seconds / 58.42 minutes**, with a conservative checked raw
+boundary of **19,851,074**. This is structural database integrity evidence,
+not a full payload-hash audit or proof of every historical calculation.
+
+At 12:50 UTC the collector was **RECORDING**, with **42.45 minutes** of child
+uptime and **68.82 minutes** of timer-covered instrumented campaign time. The
+campaign still has **NOT YET ELAPSED** for 24h, 72h and 7d. Historical 24h/72h
+gates remain **FAIL**; historical 7d remains **NOT YET ELAPSED**. The only
+post-campaign interruptions were the exercised child failure and controlled
+restart, measured as 4.08 and 9.41 seconds of missing timer coverage.
+
+Current prefix: **20,062,493 raw records**, **63,508,855 observations**,
+**2,001,951 analyzer diagnostics**, **2,415,808 episode revisions** and
+**901 checkpoints**. The newest valid checkpoint was 104 seconds old.
+No production checkpoint was unavailable.
+
+The main research database measured **160.91 GiB**, free disk approximately
+**351.2 GiB**, and maximum observed WAL allocation **10,427,748,872 bytes**.
+The main file resumed growing after the long reader completed; the allocated
+WAL file remained large. No history or WAL was manually truncated to change
+these measurements. Logical growth averaged **1.43 GiB/hour**, and CPU averaged
+**7.68% of one core**, over **42.33 minutes**. RSS was about **671 MiB**, with a
+recorded high-water mark of **886 MiB** across instrumented children.
+
+The final ordinary acceptance report completed in **27.27 seconds** and reused
+the dated integrity result. Its full JSON includes the deeper replay evidence,
+current counters, source intervals and recovery paths. The sampler regression
+also now asserts that future checkpoint, transition or quarantine metadata cannot
+change a captured prefix's selection. There are still only **five new tests**;
+the full **68-test suite passes**.
+
+The remaining evidence is **PARTIAL**: early raw-boundary warm-up beyond the
+verification budgets, exact historical quarantine totals, every-packet capture,
+indefinite-hang/machine-reboot recovery, and longer resource behavior. The
+extended duration gates have not been claimed early.
