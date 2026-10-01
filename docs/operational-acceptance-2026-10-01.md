@@ -212,3 +212,24 @@ Use `./basis acceptance --json` for the current authoritative measurements.
 The append-only `<tape>.acceptance.sqlite3` contains marker hashes/raw IDs, dated
 acceptance runs, resource samples, checkpoint/restore timings and recovery
 evidence. Raw tape, old checkpoints, old failures and paper history remain intact.
+
+## Validation update — 12:29 UTC
+
+The corrected sampler verified **41/42 regions**, making **20,274 observation
+comparisons** after replaying **247,637 raw records**, in **153.76 seconds**.
+There were **zero mismatches and zero unavailable reducer versions**. Only the
+early boundary at raw **911,111**, using archived reducer `d3202d9d4aa6c32f91c7`,
+remains unverified because causal warm-up exceeds the deep budget. Regions can
+overlap; comparison totals are not a claim of unique full-tape coverage.
+The code-crossing case is now split and verified. The result is persisted at
+12:23:22 UTC against raw prefix **19,968,656**.
+
+An additional isolated supervisor exercise held collection at **DISK_SAFETY_STOP**
+using a controlled free-space fixture with the ordinary 256 MiB reserve. After
+the fixture reported adequate space, the supervisor resumed collection in
+**1.61 seconds**, created one new child and committed new timer records. This
+exercises actual pause/resume recording, rather than only reopening a service.
+Production disk space and production data were not altered for that exercise.
+
+The full production integrity scan is still running at this update. Its result
+is not inferred from the successful sampled replay.
