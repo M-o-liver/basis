@@ -18,6 +18,7 @@ from .store import Store, encode
 from .tape import open_store
 from .paper import PaperDesk
 from .operations import Journal, RecorderMonitor
+from .evaluation_record import EvaluationWorker
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -51,6 +52,8 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
     collector = Collector(engine, monitor)
     paper = PaperDesk(engine, Path(db).with_suffix('.paper.sqlite3'))
     paper.start()
+    evaluation = EvaluationWorker(engine, journal)
+    if collect:evaluation.start()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = 'BasisResearch/1.0'
@@ -72,6 +75,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
             try:
                 if path.path == '/api/state':
                     data = engine.snapshot(); data.pop('catalog', None); data['collector'] = dict(running=bool(collector.thread and collector.thread.is_alive() and not engine.persistence_error), failure=collector.failed or engine.persistence_error)
+                    data['evaluation'] = dict(evaluation.status)
                     data['phase2']=dict(enabled=True,mode='experimental_paper',automated_policies=True,research_acceptance='open',reason='Versioned diagnostic policies and manual paper; no real orders')
                     self.send(200, data)
                 elif path.path == '/api/wallets':
@@ -101,6 +105,9 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                         self.send(200, dict(rows=list(engine.catalog.values())))
                 elif path.path == '/api/health':
                     self.send(200, dict(ok=not (collector.failed or engine.persistence_error), collecting=bool(collector.thread and collector.thread.is_alive() and not engine.persistence_error), versions=engine.snapshot()['versions']))
+                elif path.path == '/api/evaluation':
+                    from .evaluation_report import report
+                    self.send(200,report(db,q.get('campaign',[None])[0],episode_id=q.get('episode',[None])[0]))
                 elif path.path == '/api/replay':
                     self.send(200, dict(rows=store.history(q.get('event_id', [None])[0], int(q.get('from', [0])[0]), int(q.get('to', [2**63-1])[0]), int(q.get('limit', [500])[0]), int(q.get('after', [0])[0]), q.get('tail', ['0'])[0] == '1', int(q.get('before', [2**63-1])[0])),global_count=store.research_count('replay'),empty_reason='No recorded observations in this scope/page.'))
                 elif path.path == '/api/raw':
@@ -162,6 +169,14 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                     self.send(200, dict(raw_id=raw_id))
                 elif self.path == '/api/refresh':
                     collector.refresh.set(); self.send(200, dict(requested=True))
+                elif self.path == '/api/evaluation/start':
+                    from .evaluation import freeze_boundary
+                    import subprocess
+                    revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+                    campaign=freeze_boundary(db,engine.snapshot(),revision)
+                    if not evaluation.thread or not evaluation.thread.is_alive():evaluation.start()
+                    self.send(200,dict(evaluation_id=campaign['evaluation_id'],boundary=campaign['evaluation_started_at'],
+                        first_raw_id=campaign['first_eligible_global_raw_id'],first_frame_id=campaign['first_eligible_frame_id']))
                 else:
                     self.send(404, dict(error='Not found'))
             except (ValueError, TypeError, KeyError) as error:
@@ -199,7 +214,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
         journal.record('service_stop', session=engine.session, raw_id=engine.last_raw_id, pid=os.getpid(),
                        reason=reason, error=collector.failed or engine.persistence_error,
                        min_free_mb=engine.config.min_free_mb)
-        httpd.server_close(); paper.close(); collector.close()
+        httpd.server_close(); evaluation.close(); paper.close(); collector.close()
         monitor.checkpoint()
         journal.record('service_stopped', session=engine.session, raw_id=engine.last_raw_id, reason=reason)
         store.close(); journal.close(); lock.close()
