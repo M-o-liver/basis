@@ -16,9 +16,9 @@ from .replay import restore
 from .semantics import validate_mapping
 from .store import Store, encode
 from .tape import open_store
-from .paper import PaperDesk
+from .market_math import MarketMath
+from .sim import Sim
 from .operations import Journal, RecorderMonitor
-from .evaluation_record import EvaluationWorker
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -50,10 +50,30 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                    code_hash=engine.code_hash, pid=os.getpid(), collect=collect)
     monitor = RecorderMonitor(engine, journal)
     collector = Collector(engine, monitor)
-    paper = PaperDesk(engine, Path(db).with_suffix('.paper.sqlite3'))
-    paper.start()
-    evaluation = EvaluationWorker(engine, journal)
-    if collect:evaluation.start()
+    math_engine = MarketMath(engine)
+    math_engine.start()
+    sim = Sim(math_engine, Path(db).with_suffix('.sim.sqlite3'))
+    sim.start()
+
+    history_path=Path(db).parent/'gap-response.json'
+    history_cache={'mtime':None,'data':{}}
+    def historical_match(row):
+        try:
+            mtime=history_path.stat().st_mtime_ns
+            if mtime!=history_cache['mtime']:
+                history_cache.update(mtime=mtime,data=json.loads(history_path.read_text()))
+        except (OSError,ValueError):
+            return dict(n_blocks=0,status='INSUFFICIENT',match='Run ./basis gaps to measure historical response')
+        from .gap_history import bin_gap
+        gap=row.get('math',{}).get('gap_pp')
+        if gap is None:return dict(n_blocks=0,status='NO_COMPARABLE_MODEL')
+        key='|'.join((row['asset'],row['event_type'],row['direction'],bin_gap(gap)))
+        result=history_cache['data'].get('comparables',{}).get(key)
+        if result:return dict(result,match=key+' @30m; exploratory chronology-window sample'+(' / earlier equity proxy mappings' if row['asset'] not in ('BTC','ETH') else ''))
+        return dict(n_blocks=0,status='INSUFFICIENT',match=key+' has no measured comparable observations')
+    def collector_state():
+        return dict(running=bool(collector.thread and collector.thread.is_alive() and not engine.persistence_error),
+                    failure=collector.failed or engine.persistence_error)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = 'BasisResearch/1.0'
@@ -74,49 +94,33 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
             path = urlparse(self.path); q = parse_qs(path.query,keep_blank_values=True)
             try:
                 if path.path == '/api/state':
-                    data = engine.snapshot(); data.pop('catalog', None); data['collector'] = dict(running=bool(collector.thread and collector.thread.is_alive() and not engine.persistence_error), failure=collector.failed or engine.persistence_error)
-                    data['evaluation'] = dict(evaluation.status)
-                    data['phase2']=dict(enabled=True,mode='experimental_paper',automated_policies=True,research_acceptance='open',reason='Versioned diagnostic policies and manual paper; no real orders')
+                    data = engine.snapshot(); data.pop('catalog', None)
+                    data['collector'] = collector_state()
                     self.send(200, data)
-                elif path.path == '/api/wallets':
-                    self.send(200,paper.snapshot(q.get('wallet',[None])[0],int(q['run_id'][0]) if 'run_id' in q else None))
-                elif path.path == '/api/review':
-                    with paper.lock:self.send(200,paper.performance.report)
-                elif path.path == '/api/theses':
-                    with paper.lock:self.send(200,dict(rows=[t for t in paper.theses.values() if not q.get('event_id') or t['event_id']==q['event_id'][0]]))
-                elif path.path == '/api/equity':
-                    self.send(200,paper.curves(float(q.get('hours',[24])[0]),int(q['run_id'][0]) if 'run_id' in q else None))
-                elif path.path == '/api/instruments':
-                    self.send(200,paper.instruments(q.get('event_id',[None])[0],q.get('asset',[None])[0]))
-                elif path.path == '/api/order':
-                    data=paper.order_status(q.get('order_id',[''])[0])
-                    self.send(200 if data else 404,data or dict(error='No such paper order'))
-                elif path.path in ('/api/positions','/api/history'):
-                    wallet=q.get('wallet',['OLIVER'])[0];run_id=int(q['run_id'][0]) if 'run_id' in q else None
-                    with paper.lock:
-                        run,_,archived=paper.resolve_run(wallet,run_id)
-                        positions=path.path=='/api/positions'
-                        rows=paper.metrics(wallet,run_id)['positions'] if positions else paper.history(wallet,run_id,q.get('limit',[100])[0],activity_only=True)
-                        self.send(200,dict(rows=rows,wallet=wallet,run_id=run['id'],archived=archived,runs=paper.wallet_runs(wallet),
-                            empty_reason=f'No {wallet} '+('positions' if positions else 'order or trade activity')+f' in run {run["run_number"]}.',
-                            note='Archived positions use retained marks.' if positions else 'Orders, fills, rejections, cancellations, settlements and controls; periodic marks omitted.'))
-                elif path.path == '/api/catalog':
-                    with engine.lock:
-                        self.send(200, dict(rows=list(engine.catalog.values())))
+                elif path.path == '/api/markets':
+                    data = math_engine.snapshot()
+                    fields = ('event_id','event_text','asset','expiry','event_type','direction','strike_or_threshold',
+                              'pm_yes','opt_yes','math','trade','trade_reason','execution_state')
+                    rows = [dict({k:r.get(k) for k in fields},history=historical_match(r)) for r in data['rows']]
+                    self.send(200, dict(rows=rows, error=data['error'], collector=collector_state(),
+                        sources=engine.snapshot()['sources'],sim=dict(cash=sim.cash,account='BASIS SIM',error=sim.error)))
+                elif path.path == '/api/market':
+                    event_id = q.get('event_id',[''])[0]
+                    with math_engine.lock:row = math_engine.rows.get(event_id)
+                    if row is None:raise ValueError('Explicit event_id is unavailable; select a current market')
+                    self.send(200, dict(row=dict(row,history=historical_match(row)),sim=sim.snapshot(event_id)))
+                elif path.path == '/api/gap-history':
+                    event_id=q.get('event_id',[''])[0];minutes=int(q.get('minutes',[30])[0])
+                    if not event_id or minutes not in (5,30,120):raise ValueError('Require event_id and 5, 30 or 120 minutes')
+                    now=time.time_ns()//1000000
+                    rows=store.history(event_id,now-minutes*60000,now,10000,tail=True)
+                    step=max(1,len(rows)//720)
+                    self.send(200,dict(rows=[dict(t=r['timestamp_wall'],pm=r.get('pm_yes'),opt=r.get('opt_yes'),gap=r.get('gap_pp')) for r in rows[::step]],reason='No recorded observations in this time window'))
+                elif path.path == '/api/sim/order':
+                    result=sim.order(q.get('order_id',[''])[0])
+                    self.send(200 if result else 404,result or dict(error='No such BASIS SIM order'))
                 elif path.path == '/api/health':
-                    self.send(200, dict(ok=not (collector.failed or engine.persistence_error), collecting=bool(collector.thread and collector.thread.is_alive() and not engine.persistence_error), versions=engine.snapshot()['versions']))
-                elif path.path == '/api/evaluation':
-                    from .evaluation_report import report
-                    self.send(200,report(db,q.get('campaign',[None])[0],episode_id=q.get('episode',[None])[0]))
-                elif path.path == '/api/replay':
-                    self.send(200, dict(rows=store.history(q.get('event_id', [None])[0], int(q.get('from', [0])[0]), int(q.get('to', [2**63-1])[0]), int(q.get('limit', [500])[0]), int(q.get('after', [0])[0]), q.get('tail', ['0'])[0] == '1', int(q.get('before', [2**63-1])[0])),global_count=store.research_count('replay'),empty_reason='No recorded observations in this scope/page.'))
-                elif path.path == '/api/raw':
-                    row = store.raw_record(int(q.get('id', [0])[0])); self.send(200 if row else 404, row or dict(error='No such raw record'))
-                elif path.path == '/api/episodes':
-                    self.send(200, dict(rows=store.latest('episodes', 'gap_event_id', 500,q.get('event_id',[None])[0]),global_count=store.research_count('episodes'),empty_reason='No gap episodes in this scope. Episodes require the configured opening threshold.'))
-                elif path.path == '/api/algos':
-                    minutes=engine.config.analysis_window*2*engine.config.analysis_grid_seconds/60
-                    self.send(200, dict(rows=store.latest('analyzers', 'scope,algo_name', 1000,q.get('event_id',[None])[0]),global_count=store.research_count('algos'),empty_reason=f'No analyzer output in this scope. Distribution diagnostics need about {minutes:g} minutes of continuous fresh history.'))
+                    self.send(200,dict(ok=not(collector.failed or engine.persistence_error),collecting=collector_state()['running'],versions=engine.snapshot()['versions']))
                 else:
                     static = {'/': 'index.html', '/index.html': 'index.html', '/styles.css': 'styles.css', '/app.js': 'app.js'}
                     name = static.get(path.path)
@@ -144,21 +148,10 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                 if size > 65536 or size <= 0:
                     raise ValueError('Body must be 1-65536 bytes')
                 payload = json.loads(self.rfile.read(size))
-                if self.path == '/api/automation':
-                    self.send(200,paper.set_automation(payload['enabled']))
-                elif self.path == '/api/preview':
-                    with paper.lock:self.send(200,paper.preview(payload))
-                elif self.path == '/api/trade':
-                    self.send(200,paper.submit(payload))
-                elif self.path == '/api/close':
-                    with paper.lock:
-                        wallet=payload.get('wallet','OLIVER');position=paper.states[wallet]['positions'].get(payload['instrument'])
-                        if not position:raise ValueError('No position to close')
-                        self.send(200,paper.submit(dict(payload,side='SELL',quantity=position['quantity'])))
-                elif self.path == '/api/wallet/reset':
-                    self.send(200,dict(run=paper.reset(payload.get('wallet','OLIVER'))))
-                elif self.path == '/api/settle':
-                    self.send(200,paper.settle(payload))
+                if self.path == '/api/sim/buy':
+                    self.send(200,sim.submit(payload))
+                elif self.path == '/api/sim/close':
+                    self.send(200,sim.close_position(payload['position_id']))
                 elif self.path == '/api/mapping':
                     event = validate_mapping(payload)
                     raw_id = engine.ingest('operator', 'mapping', event['event_id'], event)
@@ -169,14 +162,6 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                     self.send(200, dict(raw_id=raw_id))
                 elif self.path == '/api/refresh':
                     collector.refresh.set(); self.send(200, dict(requested=True))
-                elif self.path == '/api/evaluation/start':
-                    from .evaluation import freeze_boundary
-                    import subprocess
-                    revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
-                    campaign=freeze_boundary(db,engine.snapshot(),revision)
-                    if not evaluation.thread or not evaluation.thread.is_alive():evaluation.start()
-                    self.send(200,dict(evaluation_id=campaign['evaluation_id'],boundary=campaign['evaluation_started_at'],
-                        first_raw_id=campaign['first_eligible_global_raw_id'],first_frame_id=campaign['first_eligible_frame_id']))
                 else:
                     self.send(404, dict(error='Not found'))
             except (ValueError, TypeError, KeyError) as error:
@@ -214,7 +199,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
         journal.record('service_stop', session=engine.session, raw_id=engine.last_raw_id, pid=os.getpid(),
                        reason=reason, error=collector.failed or engine.persistence_error,
                        min_free_mb=engine.config.min_free_mb)
-        httpd.server_close(); evaluation.close(); paper.close(); collector.close()
+        httpd.server_close(); sim.close(); math_engine.close(); collector.close()
         monitor.checkpoint()
         journal.record('service_stopped', session=engine.session, raw_id=engine.last_raw_id, reason=reason)
         store.close(); journal.close(); lock.close()

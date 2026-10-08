@@ -10,7 +10,6 @@ from basislab.equities import calendar, session_close, snapshot
 from basislab.pricing import derive
 from basislab.semantics import infer_event, timestamp
 from basislab.store import Store
-from basislab.thesis import underlying_thesis, expression_thesis
 from basislab.replay import EQUITY_MIGRATION, INTERACTION_MIGRATION, reducer_hash
 
 NOW=timestamp('2026-09-28T18:00:00Z')
@@ -58,9 +57,11 @@ class EquityThesisTests(unittest.TestCase):
             self.assertEqual(data['partial_errors'],[])
             self.assertFalse(data['expiry_coverage'][1]['within_model_window'])
             surface=dict(data['chains'][1],venue='yahoo',received_ms=now,source_ms=now)
-            event=dict(expiry=cutoffs[1],event_type='touch',direction='up',strike_or_threshold=320)
-            result=derive(event,dict(yes=.2,source_ms=now),surface,dict(price=300),None,now,Config())
-            self.assertIsNone(result['opt_yes']);self.assertEqual(result['source_state'],'CUTOFF')
+            event=dict(asset='AAPL',expiry=cutoffs[1],event_type='touch',direction='up',strike_or_threshold=320,window_start=now-3600000)
+            result=derive(event,dict(yes=.2,source_ms=now),surface,dict(price=300,source_ms=now,venue='yahoo'),
+                          dict(received_ms=now,low=299,high=301,error=False),now,Config())
+            self.assertIsNotNone(result['opt_yes']);self.assertEqual(result['source_state'],'PROXY')
+            self.assertIn('EQUITY_LATER_EXPIRY_IV_PROXY_UP_TO_7_DAYS',result['quality_flags'])
             self.assertEqual(data['chains'][1]['puts'][0]['bid'],23)
             def chain_with_outage(date):
                 if date=='2026-10-02':raise RuntimeError('provider timeout')
@@ -100,24 +101,6 @@ class EquityThesisTests(unittest.TestCase):
         raw=s.raw_record(e.last_raw_id)
         self.assertEqual(raw['payload']['checkpoint_migration'],'equity-context-1')
         self.assertEqual(INTERACTION_MIGRATION[0],EQUITY_MIGRATION[1])
-        self.assertEqual(reducer_hash('basislab'),INTERACTION_MIGRATION[1]);s.close()
-
-    def test_underlying_opposes_bearish_alarm(self):
-        row=dict(event_id='m',asset='BTC',spot=110,strike_or_threshold=120,event_type='touch',direction='up',
-            expiry=NOW+86400000,pm_yes=.2,opt_yes=.3,gap_pp=-10,source_state='PROXY',surface_features=dict(local_iv=.5))
-        history=[dict(timestamp_wall=NOW-(60-i)*60000,spot=100+i/6,source_state='PROXY') for i in range(61)]
-        result=underlying_thesis(row,history,NOW)
-        self.assertFalse(result['eligible'])
-        self.assertTrue(any('opposes' in reason for reason in result['rejection_reasons']))
-        future=dict(timestamp_wall=NOW+1,spot=1,source_state='PROXY')
-        self.assertEqual(result,underlying_thesis(row,history+[future],NOW))
-
-    def test_catalyst_and_closed_session_block_stock_automation(self):
-        row=dict(event_id='m',asset='AAPL',spot=300,strike_or_threshold=320,event_type='touch',direction='up',
-            expiry=NOW+86400000,pm_yes=.3,opt_yes=.2,gap_pp=10,source_state='PROXY',surface_features=dict(local_iv=.5),
-            underlying_context=dict(market_state='CLOSED',catalyst=dict(status='AVAILABLE',earnings_dates=[NOW+3600000])))
-        reasons=underlying_thesis(row,[],NOW)['rejection_reasons']
-        self.assertTrue(any('closed' in r for r in reasons));self.assertTrue(any('Earnings' in r for r in reasons))
-
+        self.assertNotEqual(reducer_hash('basislab'),INTERACTION_MIGRATION[1]);s.close()
 
 if __name__=='__main__':unittest.main()

@@ -125,7 +125,8 @@ def sampled_replay(tape, regions, checkpoints, deep=False):
         engine.restoring = True  # Skip recomputing unrelated analyzer outputs, not observations.
         historical_replay = importlib.import_module(engine.__class__.__module__.rsplit('.',1)[0]+'.replay')
         migrations = tuple(getattr(historical_replay,name,None) for name in
-                           ('EQUITY_MIGRATION','INTERACTION_MIGRATION','CHECKPOINT_GUARD_MIGRATION'))
+                           ('EQUITY_MIGRATION','INTERACTION_MIGRATION','CHECKPOINT_GUARD_MIGRATION',
+                            'MARKETS_MIGRATION','MARKETS_PROXY_MIGRATION','MARKETS_CHECKPOINT_MIGRATION'))
         eligible = []
         for cp in reversed(checkpoints):
             if cp['raw_id'] >= region['start']:

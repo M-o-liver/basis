@@ -77,6 +77,10 @@ The revised collector passed 41 research tests. A raw-integrity scan verified 91
 The earlier dated findings above are preserved. An independent prospective
 campaign is now permanently registered on storage v2; its protocol, actual
 runtime evidence and outstanding scientific limitations are recorded in
-[the prospective evaluation record](prospective-evaluation-2026-10-01.md).
+[the prospective evaluation record](archive/prospective-evaluation-2026-10-01.md).
 Current status is **INSUFFICIENT_PROSPECTIVE_SAMPLE**. This does not change the
 operational gates or claim an informational/trading edge.
+
+## 2026-10-08 — Markets / gap-math reset
+
+Active exotic analyzers, evaluation worker and old paper-policy/wallet runtime are retired. Historical raw tape, frames, records, source-code archives, old paper database and frozen prospective sidecar remain. The live product is one market table plus concrete option payoff math and operator-only BASIS SIM. Probability-1.3.0 explicitly versions the seven-day Yahoo equity IV proxy. This does not retroactively pass earlier acceptance gates or establish information edge. See [reset measurements and verification](gap-response-2026-10-08.md).

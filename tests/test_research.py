@@ -8,7 +8,6 @@ import tempfile
 import time
 import unittest
 import numpy as np
-from basislab.algos import asynchronous_sync, covariance_geometry, event_sync, lead_lag, ordinal_mmd, run_algos, sliced_wasserstein, topology
 from basislab.config import Config
 from basislab.engine import Engine
 from basislab.features import Dynamics, Episodes, curves
@@ -166,12 +165,6 @@ class ResearchTests(unittest.TestCase):
         for i,r in enumerate(rows): r['strike_or_threshold']=100+i*10
         curve=curves(rows)[0]; self.assertEqual(len(curve['monotonicity_violations']),1)
         rows[1]['event_type']='touch'; self.assertEqual(len(curves(rows)[0]['nodes']),2)
-    def test_analyzers_are_versioned_and_sequential_is_disabled(self):
-        feed(self.engine); self.engine.ingest('basis','timer','clock',dict(analyze=True),received_ms=NOW+100)
-        rows=self.store.latest('analyzers','scope,algo_name'); self.assertEqual(len(rows),7)
-        self.assertTrue(all(x['algo_version'] and x['input_window']['raw_id_max']<=x['raw_id'] for x in rows))
-        self.assertEqual(next(x for x in rows if x['algo_name']=='sequential_martingale')['status'],'disabled')
-
     def test_invalid_transform_time_cannot_become_probability(self):
         for value in (float('nan'),float('inf'),None,-1,0):
             self.assertIsNone(touch_probability(100,120,.4,value,'up'))
@@ -199,9 +192,6 @@ class ResearchTests(unittest.TestCase):
         d.update(obs(.7,p=.41,q=.41))
         events=list(d.salient[('m','mapping')])
         self.assertEqual([e['timestamp']-NOW for e in events],[100,700])
-        result=asynchronous_sync(events,NOW+2000,[1])[0]
-        self.assertEqual(result['pm_then_opt']['probability'],1)
-        self.assertEqual(result['opt_then_pm']['probability'],0)
         broken=obs(1); broken['source_state']='STALE'; d.update(broken)
         self.assertEqual(list(d.salient[('m','mapping')]),[])
 
@@ -280,38 +270,5 @@ class ResearchTests(unittest.TestCase):
             (archive/'pricing.py').write_text('# A pricing change must rebuild state\n')
             self.assertNotEqual(reducer_hash(source),reducer_hash(archive))
 
-
-class SyntheticAlgoTests(unittest.TestCase):
-    def test_wasserstein_detects_distribution_shift(self):
-        rng=np.random.default_rng(12); a=rng.normal(size=(128,4)); b=a.copy(); b[:,2]+=3
-        quiet,_=sliced_wasserstein(a,a,['a','b','c','d']); shift,contributors=sliced_wasserstein(a,b,['a','b','c','d'])
-        self.assertEqual(quiet,0); self.assertGreater(shift,1); self.assertTrue(any(abs(x['weights'].get('c',0))>.8 for x in contributors))
-    def test_covariance_detects_relationship_change(self):
-        rng=np.random.default_rng(4); x=rng.normal(size=300)
-        a=np.column_stack((x,x+rng.normal(size=300)*.1)); b=np.column_stack((x,-x+rng.normal(size=300)*.1))
-        same,_=covariance_geometry(a,a,['x','y']); changed,pairs=covariance_geometry(a,b,['x','y'])
-        self.assertLess(same,1e-8); self.assertGreater(changed,3); self.assertLess(pairs[0]['correlation_change'],-1.5)
-    def test_ordinal_mmd_detects_motif_change(self):
-        same,_=ordinal_mmd(np.arange(100),np.arange(100)); changed,m=ordinal_mmd(np.arange(100),-np.arange(100))
-        self.assertEqual(same,0); self.assertGreater(changed,1); self.assertTrue(m)
-    def test_known_pm_leads_and_reverse(self):
-        rng=np.random.default_rng(9); returns=rng.normal(size=500)*.001
-        pm=.5+np.cumsum(returns); opt=np.r_[np.repeat(pm[0],5),pm[:-5]]; spot=100*np.exp(np.cumsum(rng.normal(size=500)*.0001))
-        row=lead_lag(pm,opt,spot,1,[5])[0]; self.assertEqual(row['direction'],'PM_LEADS_OPT',row)
-        reverse=lead_lag(opt,pm,spot,1,[5])[0]; self.assertEqual(reverse['direction'],'OPT_LEADS_PM',reverse)
-    def test_event_sync_excludes_censored_and_simultaneous_events(self):
-        times=np.arange(8)*1000; p=np.array([0,1,1,1,2,2,2,3]); q=np.array([0,0,1,1,2,2,2,2])
-        result=event_sync(p,q,np.ones(8)*100,times,[2],threshold_pp=10)[0]
-        self.assertEqual(result['pm_then_opt']['triggers'],2); self.assertEqual(result['pm_then_opt']['count'],1)
-    def test_topology_detects_coherent_island(self):
-        rng=np.random.default_rng(2); a=rng.normal(size=(400,4)); x=rng.normal(size=400)
-        b=np.column_stack([x+rng.normal(size=400)*.03 for _ in range(3)]+[rng.normal(size=400)])
-        score,diag=topology(a,b,['3100','3200','3300','central'])
-        self.assertGreater(score,.3); self.assertTrue(any(['3100','3200','3300'] in x['new_clusters'] for x in diag['filtration']))
-    def test_full_graph_has_no_nonfinite_outputs_or_fake_evidence(self):
-        rows=[obs(i*15,p=.4+.02*math.sin(i/5),q=.4+.015*math.sin((i-3)/5)) for i in range(128)]
-        outputs=run_algos('test',rows,Config(),rows[-1]['timestamp_wall'])
-        self.assertEqual(len(outputs),7); encode(outputs)
-        self.assertIsNone(outputs[-1]['raw_score']); self.assertEqual(outputs[-1]['status'],'disabled')
 
 if __name__=='__main__': unittest.main()
