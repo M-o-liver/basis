@@ -11,7 +11,7 @@ import time
 import uuid
 from . import CALCULATION_VERSION, FEATURE_VERSION
 from .config import Config
-from .features import Dynamics, Episodes, curves, valid
+from .features import Dynamics, Episodes, valid
 from .pricing import derive, discrepancy
 from .semantics import array, infer_event, mapping_hash, number, probability, timestamp, validate_mapping
 from .store import encode
@@ -32,7 +32,7 @@ class Engine:
         self.lock = threading.RLock()
         self.catalog, self.events, self.manual, self.books, self.spots = {}, {}, {}, {}, {}
         self.surfaces, self.histories, self.latest = {}, {}, {}
-        self.health, self.analyzer_latest = {}, {}
+        self.health = {}
         self.dynamics, self.episodes = Dynamics(self.config), Episodes(self.config)
         self.last_raw_id = 0
         self.last_received_ms = 0
@@ -120,7 +120,7 @@ class Engine:
                 self.spots={k:v for k,v in self.spots.items() if k in ('BTC','ETH')}
                 self.surfaces={k:v for k,v in self.surfaces.items() if k[0] in ('BTC','ETH')}
                 self.histories={k:v for k,v in self.histories.items() if k[0] in ('BTC','ETH')}
-                for collection in (self.dynamics.history,self.dynamics.previous,self.dynamics.salient,self.analyzer_latest):
+                for collection in (self.dynamics.history,self.dynamics.previous,self.dynamics.salient):
                     for key in list(collection):
                         if key[0] in equity_ids:del collection[key]
                 self.select_events(now)
@@ -212,8 +212,9 @@ class Engine:
     def select_events(self, now):
         candidates = [e for e in self.catalog.values() if e['event_type'] != 'unmapped' and e['active'] and e['expiry'] > now and not self.manual.get(e['event_id'], {}).get('dismissed')]
         def supported_expiry(event):
-            known = [expiry for asset, expiry in self.surfaces if asset == event['asset']]
-            return not known or any(0 <= expiry-event['expiry'] <= self.config.max_expiry_offset_hours*3600000 for expiry in known)
+            known = [surface for (asset,expiry),surface in self.surfaces.items() if asset == event['asset']]
+            return not known or any(0 <= surface['expiry']-event['expiry'] <=
+                (self.config.yahoo_max_expiry_offset_hours if surface['venue']=='yahoo' else self.config.max_expiry_offset_hours)*3600000 for surface in known)
         candidates.sort(key=lambda e: (not supported_expiry(e), e['event_type'] == 'touch', -(e['volume_24h'] or 0), e['event_id']))
         selected, counts = {}, defaultdict(int)
         for event in candidates:
@@ -303,7 +304,8 @@ class Engine:
                 target[expiry].append(dict(instrument=raw['instrument_name'], strike=float(match[5]), option_type='call' if match[6]=='C' else 'put',
                     bid=price('bid_price'), ask=price('ask_price'), mark=price('mark_price'),
                     iv=number(raw.get('mark_iv')) / 100 if number(raw.get('mark_iv')) is not None else None,
-                    forward=forward, source_ms=timestamp(raw.get('creation_timestamp')) or source_ms))
+                    forward=forward, source_ms=timestamp(raw.get('creation_timestamp')) or source_ms,
+                    volume=number(raw.get('volume')), open_interest=number(raw.get('open_interest'))))
         else:
             for chain in payload.get('chains', []):
                 grouped[chain['expiry']].extend(chain['calls'])
@@ -384,47 +386,10 @@ class Engine:
             if self.persist:
                 self.store.append_episode(record['id'], episode)
 
-    def analysis_rows(self, event, now):
-        history = self.dynamics.history[(event['event_id'], event.get('mapping_hash'))]
-        step = self.config.analysis_grid_seconds * 1000
-        end = now // step * step
-        # Longer lag scales need more pairs than the two distribution windows.
-        count = min(7200000 // step, max(2*self.config.analysis_window, int(max(self.config.analysis_scales)*1000/step)+64))
-        targets = range(end - (count - 1) * step, end + 1, step)
-        result, pointer = [], 0
-        items = list(history)
-        for target in targets:
-            while pointer + 1 < len(items) and items[pointer + 1]['timestamp_wall'] <= target:
-                pointer += 1
-            if not items:
-                break
-            row = items[pointer]
-            if row['timestamp_wall'] <= target and target - row['timestamp_wall'] <= step and valid(row) and row.get('spot'):
-                result.append(dict(row, timestamp_wall=target))
-            else:
-                # Do not bridge outages with a compressed irregular sequence labeled as a regular grid.
-                result = []
-        return result
-
     def analyze(self, record, now):
-        from .algos import run_algos
-        groups = curves(self.latest.values())
-        for event in self.events.values():
-            rows = self.analysis_rows(event, now)
-            peers = next((g['nodes'] for g in groups if any(n['event_id'] == event['event_id'] for n in g['nodes'])), [])
-            matrix, names = None, None
-            if len(peers) >= 3 and rows:
-                histories = [self.analysis_rows(self.events[p['event_id']], now) for p in peers]
-                if all(len(h) == len(rows) and [x['timestamp_wall'] for x in h] == [x['timestamp_wall'] for x in rows] for h in histories):
-                    matrix = [[h[i]['gap_pp'] for h in histories] for i in range(len(rows))]
-                    names = [p['event_id'] for p in peers]
-            native = list(self.dynamics.salient[(event['event_id'], event.get('mapping_hash'))])
-            outputs = run_algos(event['event_id'], rows, self.config, now, matrix, names, native_events=native)
-            for data in outputs:
-                data.update(code_hash=self.code_hash, raw_id=record['id'])
-                self.analyzer_latest[(data['market_scope'], data['algo_name'])] = data
-                if self.persist:
-                    self.store.append_analyzer(record['id'], data)
+        # Historical analyzers are available through their archived reducers.
+        # Current collection records source timing and frames, not exotic outputs.
+        return
 
     def snapshot(self):
         with self.lock:
@@ -436,8 +401,7 @@ class Engine:
                 if entry['state'] == 'OK' and now-entry['timestamp'] > limit:
                     health[source]['state'] = 'STALE'
             return dict(timestamp=now, rows=list(self.latest.values()), catalog=list(self.catalog.values()),
-                sources=health, spots=self.spots, curves=curves(self.latest.values()),
+                sources=health, spots=self.spots,
                 stats=self.store.stats(), diagnostics=dict(delayed_packets=self.delayed_packets, clock_errors=self.clock_errors,
                 quarantined=list(self.errors), uptime_seconds=(now-self.started_ms)/1000),
-                phase2=dict(enabled=False, reason='Research validation and sustained collection acceptance have not been signed off'),
                 versions=dict(code_hash=self.code_hash, calculation=CALCULATION_VERSION, feature=FEATURE_VERSION, config=self.config.hash))

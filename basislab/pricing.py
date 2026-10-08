@@ -94,12 +94,17 @@ def derive(event, pm, surface, spot, history, now, config):
         return fail('STALE', 'OPTIONS_AGE_LIMIT')
     expiry = surface['expiry']
     offset = expiry - event['expiry']
-    if not 0 <= offset <= config.max_expiry_offset_hours * 3600000:
+    offset_limit=config.yahoo_max_expiry_offset_hours if surface.get('venue')=='yahoo' else config.max_expiry_offset_hours
+    if not 0 <= offset <= offset_limit * 3600000:
         return fail('CUTOFF', 'OPTION_EXPIRY_DOES_NOT_COVER_EVENT')
+    if surface.get('venue')=='yahoo' and offset>config.max_expiry_offset_hours*3600000:
+        flags.append('EQUITY_LATER_EXPIRY_IV_PROXY_UP_TO_7_DAYS')
     if spot is None or number(spot.get('price')) is None or spot['price'] <= 0:
         return fail('WAIT', 'MISSING_SPOT')
     spot_age = max(config.yahoo_seconds * 2000, 90000) if spot.get('venue') == 'yahoo' else config.spot_max_age_ms
     market_closed=surface.get('venue')=='yahoo' and spot.get('context',{}).get('market_state')=='CLOSED'
+    if spot.get('source_ms') is None:
+        return fail('WAIT','MISSING_SPOT_TIMESTAMP')
     if not 0 <= now - spot['source_ms'] <= spot_age and not market_closed:
         return fail('STALE', 'SPOT_AGE_LIMIT')
     strike = event['strike_or_threshold']

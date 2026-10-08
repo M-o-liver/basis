@@ -209,7 +209,7 @@ class Collector:
 
     def yahoo_snapshot(self, asset, cutoffs, starts=()):
         from .equities import snapshot
-        return snapshot(asset,cutoffs,starts,self.engine.config.max_expiry_offset_hours)
+        return snapshot(asset,cutoffs,starts,self.engine.config.yahoo_max_expiry_offset_hours)
 
     async def yahoo(self):
         while not self.stop.is_set():
@@ -239,13 +239,9 @@ class Collector:
             await self.sleep(self.engine.config.yahoo_seconds)
 
     async def timer(self):
-        next_analysis = 0
         next_checkpoint = time.monotonic()+300
         while not self.stop.is_set():
             now = time.monotonic()
-            analyze = now >= next_analysis
-            if analyze:
-                next_analysis = now + self.engine.config.analysis_seconds
             if self.engine.store.path != ':memory:':
                 free = shutil.disk_usage(self.engine.store.path).free / 1024**2
                 if free < self.engine.config.min_free_mb:
@@ -253,7 +249,7 @@ class Collector:
                     self.failed = 'Disk reserve reached'
                     self.failure_kind = 'DISK_SAFETY_STOP'
                     self.stop.set(); return
-            self.engine.ingest('basis', 'timer', 'clock', dict(analyze=analyze))
+            self.engine.ingest('basis', 'timer', 'clock', dict(analyze=False))
             if now >= next_checkpoint:
                 if self.monitor:
                     self.monitor.checkpoint()

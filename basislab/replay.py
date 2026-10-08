@@ -21,14 +21,20 @@ INTERACTION_MIGRATION=(EQUITY_MIGRATION[1],
 # checkpoint is compatible; persistence failure state is deliberately transient.
 CHECKPOINT_GUARD_MIGRATION=(
     '9233d3c792403e868d4936761cd2505a1b2398c017d5d6aca1c5f8252af5e695',INTERACTION_MIGRATION[1])
+# Explicit product reset: retain source/dynamics state, retire analyzer work,
+# allow labeled equity later-expiry proxies in probability-1.3.0. The session
+# records the new definition; historical tape uses its exact archived reducer.
+MARKETS_MIGRATION=(INTERACTION_MIGRATION[1],
+    '9a7e3596badea2646c40759542be058f17135b094a7a4b08352913b70265628e')
+MARKETS_PROXY_MIGRATION=('43a340d6ba63664e6e9bca9ee939b8725228c4f063b2d4c87848c7728385e47a',MARKETS_MIGRATION[1])
+MARKETS_CHECKPOINT_MIGRATION=('0b2e9e080decba394fbf8c3e7f85fa2270b9db35ec48ecd0211c511df3cd0b2f',MARKETS_MIGRATION[1])
 
 
 def reducer_hash(directory):
     digest=hashlib.sha256()
     for name in ('__init__.py','algos.py','config.py','engine.py','features.py','pricing.py','semantics.py'):
         path=Path(directory)/name
-        if not path.exists(): return None
-        digest.update(name.encode());digest.update(path.read_bytes())
+        digest.update(name.encode());digest.update(path.read_bytes() if path.exists() else b'<retired-module>')
     return digest.hexdigest()
 
 
@@ -48,6 +54,8 @@ def restore(engine):
                     checkpoint=candidate;engine.restore_migration='equity-context-1'
                 elif (reducer_hash(archived),reducer_hash(Path(__file__).parent)) in (INTERACTION_MIGRATION,CHECKPOINT_GUARD_MIGRATION):
                     checkpoint=candidate;engine.restore_migration='interaction-1'
+                elif (reducer_hash(archived),reducer_hash(Path(__file__).parent)) in (MARKETS_MIGRATION,MARKETS_PROXY_MIGRATION,MARKETS_CHECKPOINT_MIGRATION):
+                    checkpoint=candidate;engine.restore_migration='markets-math-1'
         if checkpoint:
             engine.load_checkpoint(checkpoint['state'])
             print(f'BASIS restored checkpoint at raw #{checkpoint["raw_id"]}; '+getattr(engine,'restore_migration','reducer source unchanged'),flush=True)
@@ -55,9 +63,6 @@ def restore(engine):
             engine.apply(record)
             if record['id'] % 25000 == 0:
                 print(f'BASIS restoring raw #{record["id"]}', flush=True)
-        for row in engine.store.latest('analyzers', 'scope,algo_name', 1000):
-            row.pop('record_id',None)
-            engine.analyzer_latest[(row['market_scope'],row['algo_name'])] = row
     finally:
         engine.persist = persistent
         engine.restoring = False

@@ -69,7 +69,6 @@ class StorageV2Tests(unittest.TestCase):
             for record in store.raw():replay.apply(record)
             self.assertEqual(encode(replay.latest),encode(engine.latest))
             self.assertEqual(encode(replay.episodes.active),encode(engine.episodes.active))
-            self.assertEqual(encode(list(replay.analyzer_latest.values())),encode(list(engine.analyzer_latest.values())))
             self.assertEqual(encode([[list(k),list(v)] for k,v in replay.dynamics.history.items()]),encode([[list(k),list(v)] for k,v in engine.dynamics.history.items()]))
             restored=Engine(store);restore(restored);self.assertEqual(encode(restored.latest),encode(engine.latest));store.close()
 

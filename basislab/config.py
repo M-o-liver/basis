@@ -17,6 +17,7 @@ class Config:
     spot_max_age_ms: int = 30_000
     history_max_age_ms: int = 360_000
     max_expiry_offset_hours: int = 72
+    yahoo_max_expiry_offset_hours: int = 168  # Explicit near-week equity IV proxy, never exact replication.
     open_gap_pp: float = 4.0
     close_gap_pp: float = 1.0
     stable_pp: float = 0.02
@@ -47,8 +48,8 @@ class Config:
         for name in ('stable_pp', 'fast_pp_per_second', 'event_jump_pp', 'spot_jump_return'):
             if getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive')
-        if self.max_expiry_offset_hours < 0:
-            raise ValueError('max_expiry_offset_hours cannot be negative')
+        if self.max_expiry_offset_hours < 0 or self.yahoo_max_expiry_offset_hours < 0:
+            raise ValueError('Expiry offset limits cannot be negative')
         if not 0 < self.max_pm_spread <= 1:
             raise ValueError('max_pm_spread must be in (0,1]')
 
