@@ -42,6 +42,8 @@ For offline reproduction use `./basis payoff-audit captured-detail.json --max-lo
 
 The [RSI protocol](docs/rsi-protocol.md) separates actual GUI paperMoney fills from stars and exploratory tests. `./basis journal` verifies and reads the append-only local journal in `data/basis.experiment.sqlite3`. `./basis journal --record evidence.json` appends one envelope (`kind`, `data`, `observed_ms`), and `--full --output data/rsi-summary.json` exports a derived summary with every original record. Account baselines survive restart; partial closes use FIFO; unknown costs stay null; later confirmed fees append linked evidence. The journal cannot place orders. Account/fill artifacts remain Git-ignored.
 
+The journal also shows the sampled portfolio equity peak inside the original experiment window, the current effective objective, actual filled positions and a persistent work state with the agent's next action and monitoring coverage. Objective amendments append REVISION evidence; activity handoffs append STATE evidence. Earlier mandates, plans, fills and losses remain unchanged. Peak equity is based on observed broker account values, not estimated option returns or reconstructed unseen highs.
+
 ```sh
 ./basis gaps
 ./basis gaps --json --per-day 2 --output data/gap-shape.json

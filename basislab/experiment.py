@@ -13,7 +13,7 @@ import time
 from .semantics import number
 from .store import encode
 
-VERSION = 'experiment-journal-1.1'
+VERSION = 'experiment-journal-1.2'
 
 
 def execution_identity(data, kind='FILL'):
@@ -30,7 +30,7 @@ def execution_identity(data, kind='FILL'):
     if data.get('broker_id_status') != 'NOT_EXPOSED_IN_GUI' or not isinstance(local, str) or not local.strip():
         raise ValueError('Unknown broker ID needs explicit status and a local evidence reference')
     return ('local', local)
-KINDS = ('MANDATE', 'ACCOUNT', 'RESEARCH', 'REVISION', 'PLAN', 'ORDER', 'FILL', 'COST', 'MARK', 'OUTCOME')
+KINDS = ('MANDATE', 'ACCOUNT', 'RESEARCH', 'REVISION', 'STATE', 'PLAN', 'ORDER', 'FILL', 'COST', 'MARK', 'OUTCOME')
 
 
 def required(data, *fields):
@@ -43,6 +43,14 @@ def numeric(data, field, minimum=None):
     if value is None or (minimum is not None and value < minimum):
         raise ValueError('Invalid ' + field)
     return value
+
+
+def payoff_budget(snapshot):
+    """Audit affordability under the active directive; this does not size orders."""
+    if (snapshot.get('objective') or {}).get('risk_budget') == 'VENUE_BUYING_POWER':
+        return (snapshot.get('current') or {}).get('option_buying_power')
+    baseline = snapshot.get('baseline')
+    return baseline['equity'] * .005 if baseline else None
 
 
 class Experiment:
@@ -95,6 +103,17 @@ class Experiment:
                 raise ValueError('Do not combine a different account with this baseline')
         elif kind == 'REVISION':
             required(data, 'git_revision', 'reason', 'historical_result', 'forward_status')
+            if 'objective_update' in data:
+                objective = data['objective_update']
+                required(objective, 'description', 'primary_metric', 'effective_ms', 'strategy_version',
+                         'sizing_policy', 'holding_policy')
+                numeric(objective, 'effective_ms', 1)
+                if objective['primary_metric'] not in ('SAMPLED_PEAK_EQUITY', 'FINAL_EQUITY'):
+                    raise ValueError('Unknown portfolio objective')
+                if objective.get('risk_budget') not in (None, 'VENUE_BUYING_POWER', 'INITIAL_PROTOCOL_CAP'):
+                    raise ValueError('Unknown affordability budget')
+        elif kind == 'STATE':
+            required(data, 'activity', 'finding', 'next_action', 'strategy_version', 'coverage')
         elif kind in ('RESEARCH', 'OUTCOME'):
             required(data, 'finding')
         elif kind == 'COST':
@@ -176,6 +195,7 @@ class Experiment:
                 raise
 
     def snapshot(self):
+        as_of_ms = time.time_ns() // 1000000
         with self.lock:
             rows = self.records()
         previous = '0' * 64
@@ -186,6 +206,18 @@ class Experiment:
             previous = expected
         accounts = [dict(r['data'], observed_ms=r['observed_ms']) for r in rows if r['kind'] == 'ACCOUNT']
         baseline, current = (accounts[0], accounts[-1]) if accounts else (None, None)
+        mandate = next((r['data'] for r in rows if r['kind'] == 'MANDATE'), None)
+        window = dict(start_ms=mandate['start_ms'], end_ms=mandate['end_ms']) if mandate else None
+        score_accounts = [a for a in accounts if a['observed_ms'] <= as_of_ms and
+                          (not window or window['start_ms'] <= a['observed_ms'] <= window['end_ms'])]
+        peak_account = max(score_accounts, key=lambda a: a['equity']) if score_accounts else None
+        objective = dict(description=mandate['objective'], effective_ms=mandate['start_ms']) if mandate else None
+        for row in rows:
+            update = row['data'].get('objective_update') if row['kind'] == 'REVISION' else None
+            if update and update['effective_ms'] <= as_of_ms:
+                objective = dict(update, evidence_record_id=row['id'])
+        states = [dict(r['data'], observed_ms=r['observed_ms'], evidence_record_id=r['id'])
+                  for r in rows if r['kind'] == 'STATE' and r['observed_ms'] <= as_of_ms]
         peak = baseline['equity'] if baseline else 0
         drawdown = 0
         for account in accounts:
@@ -217,7 +249,7 @@ class Experiment:
             marks = [r['data'] for r in rows if r['kind'] == 'MARK' and r['data']['trade_id'] == identity]
             unrealized = sum(l['quantity'] * (marks[-1]['unit_credit'] - l['price']) for l in lots) if marks else (None if position else 0)
             trades.append(dict(trade_id=identity, category=plan['signal_category'], model_version=plan['model_version'],
-                               strategy_version=plan['strategy_version'], fill_count=len(fills), open_quantity=position,
+                               strategy_version=plan['strategy_version'], legs=plan['legs'], fill_count=len(fills), open_quantity=position,
                                completed=bool(fills) and position == 0, realized_gross=gross, realized_net=net,
                                actual_fees=costs, unrealized_gross_at_last_quote=unrealized))
         def total(field):
@@ -232,10 +264,15 @@ class Experiment:
                 group['realized_net']=group['realized_net']+trade['realized_net'] if group['realized_net'] is not None and trade['realized_net'] is not None else None
             return result
         return dict(version=VERSION, baseline=baseline, current=current,
+                    objective=objective, work_state=states[-1] if states else None, window=window,
+                    sampled_peak_equity=peak_account['equity'] if peak_account else None,
+                    sampled_peak_observed_ms=peak_account['observed_ms'] if peak_account else None,
+                    sampled_peak_gain=None if not peak_account or not baseline else peak_account['equity'] - baseline['equity'],
+                    window_last_account=score_accounts[-1] if score_accounts else None,
                     equity_change=None if not baseline else current['equity'] - baseline['equity'],
                     sampled_max_drawdown=None if not baseline else drawdown,
                     trade_count=sum(bool(t['fill_count']) for t in trades), completed_trades=sum(t['completed'] for t in trades),
                     realized_gross=total('realized_gross'), realized_net=total('realized_net'), actual_fees=total('actual_fees'),
                     trades=trades, by_signal_category=grouped('category'),by_model=grouped('model_version'),by_strategy=grouped('strategy_version'),
                     record_count=len(rows), head_hash=previous, records=rows[-40:],
-                    measurement='GUI-reported account equity; actual broker fills only. Quote marks and unknown costs are separate. Drawdown uses observed account samples.')
+                    measurement='GUI-reported account equity; actual broker fills only. Quote marks and unknown costs are separate. Peak is the highest observed account sample inside the original experiment window, including the baseline when in that window; unseen intraday peaks are unknown. Drawdown uses observed account samples.')

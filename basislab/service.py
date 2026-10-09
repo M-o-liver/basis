@@ -19,7 +19,7 @@ from .store import Store, encode
 from .tape import open_store
 from .market_math import MarketMath
 from .tracking import Tracker
-from .experiment import Experiment
+from .experiment import Experiment, payoff_budget
 from .quote_audit import audit as quote_audit
 from .payoff_audit import from_snapshot as payoff_audit
 from .operations import Journal, RecorderMonitor
@@ -126,8 +126,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                     event_id = q.get('event_id',[''])[0]
                     with math_engine.lock:row = copy.deepcopy(math_engine.rows.get(event_id))
                     if row is None:raise ValueError('Explicit event_id is unavailable; select a current market')
-                    baseline=experiment.snapshot().get('baseline')
-                    limit=baseline['equity']*.005 if baseline else None
+                    limit=payoff_budget(experiment.snapshot())
                     self.send(200,dict(audit=payoff_audit(row,max_loss_limit=limit)))
                 elif path.path == '/api/experiment':
                     self.send(200,experiment.snapshot())

@@ -3,8 +3,9 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from basislab.experiment import Experiment
+from basislab.experiment import Experiment, payoff_budget
 
 
 class ExperimentTests(unittest.TestCase):
@@ -45,6 +46,75 @@ class ExperimentTests(unittest.TestCase):
             self.journal.append('ACCOUNT', dict(d['current'], account='other-account'), 3000)
         with self.assertRaises(sqlite3.IntegrityError):
             self.journal.db.execute('DELETE FROM evidence')
+
+    def test_peak_survives_a_later_loss_and_restart_without_resetting_baseline(self):
+        def account(equity, observed):
+            self.journal.append('ACCOUNT', dict(account='paper-margin', equity=equity,
+                option_buying_power=equity, cash=equity, quote_status='DELAYED',
+                paper_money_visible=True, evidence='Observed paperMoney account'), observed)
+        account(120000, 2000)
+        account(120000, 2500)
+        account(95000, 3000)
+        self.journal.close()
+        self.journal = Experiment(self.path)
+        d = self.journal.snapshot()
+        self.assertEqual(d['baseline']['equity'], 100000)
+        self.assertEqual(d['current']['equity'], 95000)
+        self.assertEqual(d['sampled_peak_equity'], 120000)
+        self.assertEqual(d['sampled_peak_observed_ms'], 2000)
+        self.assertEqual(d['sampled_peak_gain'], 20000)
+        self.assertEqual(d['sampled_max_drawdown'], 25000)
+
+    def test_post_experiment_balance_and_quote_marks_cannot_raise_score(self):
+        self.journal.append('MANDATE', dict(start_ms=1000, end_ms=2000, git_revision='v1',
+            objective='Thirty days', evidence='Original instruction'), 1100)
+        self.plan()
+        self.journal.append('MARK', dict(trade_id='test', unit_credit=900000,
+            quote_status='DELAYED', evidence='Option quote, not account equity'), 1500)
+        self.journal.append('ACCOUNT', dict(account='paper-margin', equity=999999,
+            option_buying_power=999999, cash=999999, quote_status='DELAYED',
+            paper_money_visible=True, evidence='After experiment ended'), 3000)
+        d = self.journal.snapshot()
+        self.assertEqual(d['sampled_peak_equity'], 100000)
+        self.assertEqual(d['window_last_account']['equity'], 100000)
+        self.assertEqual(d['current']['equity'], 999999)
+        self.assertEqual(d['trade_count'], 0)
+
+    def test_future_objective_waits_for_activation_and_preserves_old_mandate(self):
+        self.journal.append('MANDATE', dict(start_ms=1000, end_ms=9000, git_revision='v1',
+            objective='Original research objective', evidence='Original instruction'), 1100)
+        self.journal.append('REVISION', dict(git_revision='v2', reason='Operator changed score',
+            historical_result='No retrospective strategy result', forward_status='Effective at 2000',
+            objective_update=dict(description='Maximize peak equity', primary_metric='SAMPLED_PEAK_EQUITY',
+                effective_ms=2000, strategy_version='s2', sizing_policy='Half Kelly',
+                holding_policy='Thesis horizon', risk_budget='VENUE_BUYING_POWER'),
+            evidence='Later operator instruction'), 1500)
+        with patch('basislab.experiment.time.time_ns', return_value=1900 * 1000000):
+            self.assertEqual(self.journal.snapshot()['objective']['description'], 'Original research objective')
+            self.assertEqual(payoff_budget(self.journal.snapshot()), 500)
+        with patch('basislab.experiment.time.time_ns', return_value=2000 * 1000000):
+            d = self.journal.snapshot()
+        self.assertEqual(d['objective']['primary_metric'], 'SAMPLED_PEAK_EQUITY')
+        self.assertEqual(payoff_budget(d), 100000)
+        original = next(r for r in self.journal.records() if r['kind'] == 'MANDATE')
+        self.assertEqual(original['data']['objective'], 'Original research objective')
+        self.assertEqual(d['window']['end_ms'], 9000)
+
+    def test_work_state_survives_display_tail_and_positions_come_from_fills(self):
+        self.plan()
+        self.journal.append('STATE', dict(activity='RESEARCH', finding='Inspecting BASIS event',
+            next_action='Read actual offered contracts', strategy_version='s2', coverage='ON_DEMAND',
+            evidence='Current session'), 1150)
+        for i in range(45):
+            self.journal.append('RESEARCH', dict(finding='Observation', evidence='Captured tape'), 1160+i)
+        self.fill('open', 'OPEN', 2, 100, 2)
+        d = self.journal.snapshot()
+        self.assertEqual(d['work_state']['next_action'], 'Read actual offered contracts')
+        self.assertFalse(any(r['kind'] == 'STATE' for r in d['records']))
+        self.assertEqual(d['trades'][0]['open_quantity'], 2)
+        self.assertEqual(d['trades'][0]['legs'][0]['instrument'], 'EXACT')
+        self.fill('close', 'CLOSE', 2, 90, 2)
+        self.assertEqual(self.journal.snapshot()['trades'][0]['open_quantity'], 0)
 
     def test_partial_closes_use_fifo_actual_fills_and_fees(self):
         self.plan()
