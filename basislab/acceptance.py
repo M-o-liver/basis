@@ -185,6 +185,36 @@ def gate_status(hours, recorded_seconds, gaps, replay, integrity, recovery_compl
     return 'PASS'
 
 
+def current_recording(path, snapshot_boundary, snapshot_last_timer):
+    """Fresh persisted heartbeat, separate from the frozen replay prefix.
+
+    Replay/integrity work can outlast the heartbeat timeout. Read only the
+    newly committed suffix at completion; do not widen the historical sample.
+    A live API thread alone does not establish durable recording.
+    """
+    fresh=ReadTape(path)
+    try:
+        if fresh.boundary < snapshot_boundary:
+            raise ValueError('Tape boundary regressed during acceptance')
+        last_timer=snapshot_last_timer
+        if hasattr(fresh,'marker_records'):
+            for row in fresh.marker_records('timer',snapshot_boundary,fresh.boundary):
+                if row['subject']=='clock':last_timer=row['received_ms']
+            last=fresh.raw_record(fresh.boundary) if fresh.boundary else None
+            last_received=last['received_ms'] if last else None
+        else:
+            row=fresh.db.execute("SELECT received_ms FROM raw WHERE kind='timer' AND subject='clock' AND id<=? ORDER BY id DESC LIMIT 1",(fresh.boundary,)).fetchone()
+            last_timer=row[0] if row else None
+            row=fresh.db.execute('SELECT received_ms FROM raw WHERE id=?',(fresh.boundary,)).fetchone()
+            last_received=row[0] if row else None
+        observed=time.time_ns()//1_000_000
+        recent=last_timer is not None and 0<=observed-last_timer<=30_000
+        return dict(state='RECORDING' if recent else 'STALE_OR_STOPPED',
+                    freshness_observed_ms=observed,freshness_raw_boundary=fresh.boundary,
+                    last_timer_ms=last_timer,last_committed_raw_ms=last_received)
+    finally:fresh.close()
+
+
 def report(path, url='http://127.0.0.1:8765', deep=False, quick_check=False):
     started=time.monotonic(); now=time.time_ns()//1_000_000
     tape=ReadTape(path); journal=Journal(path)
@@ -293,14 +323,17 @@ def report(path, url='http://127.0.0.1:8765', deep=False, quick_check=False):
                 live=None;live_error='API belongs to a different database'
         except (OSError,ValueError) as error:
             live_error=str(error)
-        current_time=time.time_ns()//1_000_000
         if segmented:
             last_timer_record=next(reversed(timer_rows),None)
             row=(last_timer_record['timestamp_ms'],) if last_timer_record else None
         else:row=tape.db.execute("SELECT received_ms FROM raw WHERE kind='timer' AND subject='clock' ORDER BY id DESC LIMIT 1").fetchone()
-        last_timer=row[0] if row else None
-        recent=last_timer is not None and 0<=current_time-last_timer<=30_000
-        collector_state='RECORDING' if recent else 'STALE_OR_STOPPED'
+        snapshot_last_timer=row[0] if row else None
+        try:freshness=current_recording(path,tape.boundary,snapshot_last_timer)
+        except (OSError,ValueError,sqlite3.Error) as error:
+            freshness=dict(state='CURRENT_FRESHNESS_UNVERIFIED',freshness_error=str(error),
+                           freshness_observed_ms=time.time_ns()//1_000_000)
+        current_time=time.time_ns()//1_000_000
+        collector_state=freshness['state']
         if live and (live['collector'].get('failure') or not live['collector'].get('running')):
             collector_state='FAILED_OR_NOT_COLLECTING'
         campaign=journal.latest('campaign_start')
@@ -316,8 +349,9 @@ def report(path, url='http://127.0.0.1:8765', deep=False, quick_check=False):
         if segmented:criteria.update(version='operational-v2',integrity='Closed v2 segments checked/hash-recorded once; unchanged immutable files reuse that evidence. Small active segment checked now. Frozen v1 retains dated evidence separately; no daily live monolith rescan.')
         size=resources(path)
         result=dict(acceptance_version=criteria['version'],timestamp_ms=current_time,snapshot_started_ms=now,code_hash=live.get('versions',{}).get('code_hash') if live else None,
-            criteria=criteria,collector=dict(state=collector_state,current_uptime_seconds=live.get('diagnostics',{}).get('uptime_seconds') if live else None,
-                last_committed_raw_ms=last[0] if last else None,last_timer_ms=last_timer,api_error=live_error,live=live.get('collector') if live else None),
+            criteria=criteria,collector=dict(freshness,state=collector_state,current_uptime_seconds=live.get('diagnostics',{}).get('uptime_seconds') if live else None,
+                snapshot_last_committed_raw_ms=last[0] if last else None,snapshot_last_timer_ms=snapshot_last_timer,
+                api_error=live_error,live=live.get('collector') if live else None),
             tape=dict(path=str(Path(path).resolve()),raw_boundary=tape.boundary,first_received_ms=first[0] if first else None,
                 database_bytes=size['database_bytes'],wal_bytes=size['wal_bytes'],storage_version=2 if segmented else 1,
                 free_bytes=shutil.disk_usage(Path(path).parent).free,growth_bytes_per_hour=growth,counts=totals),

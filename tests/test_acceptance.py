@@ -3,16 +3,48 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from basislab.acceptance import chronology, gate_status, source_accounting
+from basislab.acceptance import chronology, current_recording, gate_status, source_accounting
 from basislab.engine import Engine
 from basislab.replay import restore
 from basislab.sample_replay import ReadTape, choose_regions, sampled_replay
 from basislab.service import serve
 from basislab.store import Store, encode
+from basislab.tape import create_tape, publish_tape
 from test_research import feed, NOW
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_long_replay_does_not_age_a_frozen_timer_but_real_stalls_remain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'tape.sqlite3';store=Store(path);engine=Engine(store)
+            engine.ingest('basis','timer','clock',{},received_ms=NOW)
+            frozen_boundary=engine.last_raw_id
+            engine.ingest('basis','timer','clock',{},received_ms=NOW+65_000)
+            with patch('basislab.acceptance.time.time_ns',return_value=(NOW+70_000)*1_000_000):
+                live=current_recording(path,frozen_boundary,NOW)
+            self.assertEqual(live['state'],'RECORDING')
+            self.assertGreater(live['freshness_raw_boundary'],frozen_boundary)
+            self.assertEqual(live['last_timer_ms'],NOW+65_000)
+            with patch('basislab.acceptance.time.time_ns',return_value=(NOW+120_000)*1_000_000):
+                stale=current_recording(path,frozen_boundary,NOW)
+            self.assertEqual(stale['state'],'STALE_OR_STOPPED')
+            store.close()
+
+    def test_v2_heartbeat_refresh_reads_only_new_suffix_across_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'alias';store=create_tape(path,Path(directory)/'tape')
+            publish_tape(store)
+            engine=Engine(store);engine.ingest('basis','timer','clock',{},received_ms=NOW)
+            frozen=engine.last_raw_id
+            store.rotate('test')
+            engine.ingest('basis','timer','clock',{},received_ms=NOW+65_000)
+            with patch('basislab.acceptance.time.time_ns',return_value=(NOW+70_000)*1_000_000):
+                live=current_recording(path,frozen,NOW)
+            self.assertEqual(live['state'],'RECORDING')
+            self.assertEqual(live['last_timer_ms'],NOW+65_000)
+            self.assertEqual(live['freshness_raw_boundary'],engine.last_raw_id)
+            store.close()
+
     def test_sampler_is_stable_causal_and_missing_versions_are_not_matches(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'tape.sqlite3';store=Store(path);engine=Engine(store);feed(engine)

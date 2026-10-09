@@ -2,6 +2,7 @@ import argparse
 import curses
 from datetime import datetime, timezone
 import json
+import math
 import textwrap
 import time
 import urllib.request
@@ -81,7 +82,58 @@ def main():
     gaps.add_argument('--output',default='data/gap-shape.json');gaps.add_argument('--no-trade-math',action='store_true')
     gaps.add_argument('--from',dest='gap_start');gaps.add_argument('--to',dest='gap_end')
     math_command=commands.add_parser('math');math_command.add_argument('event_id')
+    payoff_command=commands.add_parser('payoff-audit',help='Offline equity payoff sensitivity from a captured BASIS detail; never orders')
+    payoff_command.add_argument('snapshot',help='JSON file containing a captured BASIS row or /api/market response')
+    payoff_command.add_argument('--book',help='Optional normalized paperMoney GUI quote JSON; exact captured contracts only')
+    payoff_command.add_argument('--max-loss',type=float,help='Explicit research risk cap; the UI uses the recorded baseline and protocol')
+    payoff_command.add_argument('--output',help='Save a derived report; never edits source evidence')
+    kelly_command=commands.add_parser('kelly-audit',help='Model-dependent expiry half Kelly from captured evidence; never orders')
+    kelly_command.add_argument('snapshot')
+    kelly_command.add_argument('--book',required=True)
+    kelly_command.add_argument('--instrument',required=True)
+    kelly_command.add_argument('--entry-price',type=float,required=True)
+    kelly_command.add_argument('--equity',type=float,required=True)
+    kelly_command.add_argument('--output')
+    experiment_command=commands.add_parser('journal',help='GUI paperMoney evidence and account record; never orders')
+    experiment_command.add_argument('--record',help='Append one local JSON evidence envelope: kind, data, observed_ms')
+    experiment_command.add_argument('--output',help='Export a derived JSON summary; original evidence remains immutable')
+    experiment_command.add_argument('--full',action='store_true',help='Include every original record in the derived export')
     args = parser.parse_args()
+    if args.command=='kelly-audit':
+        from pathlib import Path
+        from .kelly_audit import sizing
+        from .tape import atomic_json
+        captured=json.loads(Path(args.snapshot).read_text())
+        result=sizing(captured.get('row',captured),json.loads(Path(args.book).read_text()),args.instrument,args.entry_price,args.equity)
+        if args.output:atomic_json(args.output,result)
+        print(json.dumps(result,indent=2));return
+    if args.command=='payoff-audit':
+        from pathlib import Path
+        from .payoff_audit import from_snapshot
+        from .tape import atomic_json
+        if args.max_loss is not None and (not math.isfinite(args.max_loss) or args.max_loss<=0):
+            parser.error('--max-loss must be finite and positive')
+        captured=json.loads(Path(args.snapshot).read_text())
+        row=captured.get('row',captured)
+        book=json.loads(Path(args.book).read_text()) if args.book else None
+        result=from_snapshot(row,book,args.max_loss)
+        if args.output:atomic_json(args.output,result)
+        print(json.dumps(result,indent=2));return
+    if args.command=='journal':
+        from pathlib import Path
+        from .experiment import Experiment
+        from .tape import atomic_json
+        journal=Experiment(Path(args.db).with_suffix('.experiment.sqlite3'))
+        try:
+            if args.record:
+                record=json.loads(Path(args.record).read_text())
+                journal.append(record['kind'],record['data'],record.get('observed_ms'))
+            result=journal.snapshot()
+            if args.full:result['records']=journal.records()
+            if args.output:atomic_json(args.output,result)
+            print(json.dumps(result,indent=2))
+        finally:journal.close()
+        return
     if args.command=='storage-shadow':
         from .storage_shadow import run_shadow
         result=run_shadow(args.db,args.output,args.minutes);print(json.dumps(result,indent=2))

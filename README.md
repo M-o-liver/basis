@@ -4,7 +4,7 @@ A dense, monochrome market table for one question: when Polymarket probability P
 
 **Polymarket is the reference signal.** Conventional-market exposure is cheap when P > Q and rich when P < Q. Options probabilities are risk-neutral/model estimates, not necessarily physical beliefs.
 
-The browser contains only **Markets**, one selected-event math pane and a compact **Starred** section. It shows actual calls/puts, gap formation, log-odds/odds ratio, exact defined-risk structures, conditional payoffs, PM information value versus execution drag and historical event/day sample counts.
+The browser contains **Markets**, one selected-event math pane, a compact **Starred** section and the **paperMoney experiment journal**. It shows actual calls/puts, gap formation, log-odds/odds ratio, exact defined-risk structures, conditional payoffs, PM information value versus execution drag and historical event/day sample counts.
 
 ## Run
 
@@ -33,6 +33,16 @@ Conditional paths use the existing flat-IV/zero-carry GBM, continuous barriers a
 US equities use multiplier 100. Deribit inverse premiums are converted from their native coin units at observed spot, with multiplier 1; tracked results are a USD payoff proxy. Native exchange settlement differs from this representation. Yahoo American options, zero dividends, overnight paths and later expiry remain explicit proxies. The underlying probability-1.3.0 reducer is unchanged.
 
 ## Historical research
+
+Selected equity details expose the captured resolution wording and `quote-audit-1.0`: OTM bid/mid/ask IV inversion plus a regular-session touch sensitivity check. It never rewrites the recorded Q or silently replaces the probability reducer. Nights evolve prices but cannot resolve a regular-session barrier. Its numerical error is not model or trading confidence.
+
+The **Audit defined-risk payoffs** button captures an on-demand `payoff-audit-1.0` report. It couples regular-session touch outcomes with later option expiry payoffs, checks each leg against its quoted book, and tests the entire PM bid/ask interval. Fixed OTM bid/mid/ask, session variance and carry scenarios expose fragile EV. Analytic vanilla prices anchor the baseline; a conditional PM mass tilt is an unvalidated research assumption. A sensitivity pass still requires venue, latency and forward validation. Reports retain their capture time until explicitly updated; starred structures keep their original mathematics.
+
+For offline reproduction use `./basis payoff-audit captured-detail.json --max-loss 500 --output data/payoff-audit.json`. An optional `--book captured-gui-book.json` supplies normalized paperMoney GUI quotes for the exact captured contracts. The book contains `asset`, `expiry` (UTC milliseconds), `spot`, `received_ms`, `source_ms` (null when unknown), `quote_status` and `contracts` with `instrument`, `strike`, `option_type`, `bid`, `ask`. Underlying/expiry/contract mismatches and pre-signal receipts are rejected. Neither receipt timestamps nor this model establish synchronous exchange quotes. This CLI is an engineering/research tool; execution remains in the paperMoney GUI.
+
+The [RSI protocol](docs/rsi-protocol.md) separates actual GUI paperMoney fills from stars and exploratory tests. `./basis journal` verifies and reads the append-only local journal in `data/basis.experiment.sqlite3`. `./basis journal --record evidence.json` appends one envelope (`kind`, `data`, `observed_ms`), and `--full --output data/rsi-summary.json` exports a derived summary with every original record. Account baselines survive restart; partial closes use FIFO; unknown costs stay null; later confirmed fees append linked evidence. The journal cannot place orders. Account/fill artifacts remain Git-ignored.
+
+The journal also shows the sampled portfolio equity peak inside the original experiment window, the current effective objective, actual filled positions and a persistent work state with the agent's next action and monitoring coverage. Objective amendments append REVISION evidence; activity handoffs append STATE evidence. Earlier mandates, plans, fills and losses remain unchanged. Peak equity is based on observed broker account values, not estimated option returns or reconstructed unseen highs.
 
 ```sh
 ./basis gaps
