@@ -1,5 +1,6 @@
 """Loopback API and static terminal. The collector owns data, the UI only reads it."""
 import json
+import copy
 import logging
 import mimetypes
 import os
@@ -20,6 +21,7 @@ from .market_math import MarketMath
 from .tracking import Tracker
 from .experiment import Experiment
 from .quote_audit import audit as quote_audit
+from .payoff_audit import from_snapshot as payoff_audit
 from .operations import Journal, RecorderMonitor
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -120,6 +122,13 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                                      puts=[c for c in chain if c['option_type']=='put'])
                         detail['quote_audit']=quote_audit(row,surface,row['calculated_at'])
                     self.send(200, dict(row=detail))
+                elif path.path == '/api/payoff-audit':
+                    event_id = q.get('event_id',[''])[0]
+                    with math_engine.lock:row = copy.deepcopy(math_engine.rows.get(event_id))
+                    if row is None:raise ValueError('Explicit event_id is unavailable; select a current market')
+                    baseline=experiment.snapshot().get('baseline')
+                    limit=baseline['equity']*.005 if baseline else None
+                    self.send(200,dict(audit=payoff_audit(row,max_loss_limit=limit)))
                 elif path.path == '/api/experiment':
                     self.send(200,experiment.snapshot())
                 elif path.path == '/api/gap-history':
