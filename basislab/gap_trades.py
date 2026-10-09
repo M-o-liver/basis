@@ -1,78 +1,156 @@
-"""Historical ask/bid trade math, using only quotes available by each deadline."""
+"""Fixed-horizon exploratory structure returns; frozen legs and causal source quotes."""
 from collections import Counter,defaultdict
 import copy
 import math
-from pathlib import Path
 import numpy as np
-from .config import Config
 from .engine import Engine
-from .gap_math import execution_cost
-from .gap_history import bin_gap,bin_odds
+from .gap_math import execution_cost, gap_math, payoff
+from .gap_history import HotTape,bin_gap,bin_odds
 from .market_math import MarketMath,execution_quote
 from .tape import open_store
+from .semantics import timestamp,number
+from .equities import calendar,regular_session
+from datetime import datetime,timedelta
+from zoneinfo import ZoneInfo
+
+
+def next_open(now):
+    day=datetime.fromtimestamp(now/1000,ZoneInfo('America/New_York')).date();cal=calendar(day)
+    for session in cal.sessions_in_range(day.isoformat(),(day+timedelta(days=20)).isoformat()):
+        opened=int(cal.session_open(session).timestamp()*1000)
+        if opened>now:return opened
+    raise ValueError('No XNYS open in calendar coverage')
+
+
+def exact_quotes(trade,surface,spot,at):
+    if surface is None or surface['expiry']!=trade['expiry']:raise ValueError('EXACT_EXPIRY_UNAVAILABLE')
+    equity=surface['venue']=='yahoo';limit=120000 if equity else 45000
+    if not 0<=at-surface['received_ms']<=limit:raise ValueError('QUOTE_STALE')
+    if equity and (regular_session(at)['market_state']!='OPEN' or surface.get('context',{}).get('market_state')!='OPEN'):raise ValueError('MARKET_CLOSED')
+    if not spot or not spot.get('price') or spot.get('received_ms',at)>at:raise ValueError('NO_CAUSAL_SPOT')
+    if not equity and not 0<=at-spot.get('source_ms',0)<=30000:raise ValueError('SPOT_STALE')
+    out=[]
+    for leg in trade['legs']:
+        c=next((c for c in surface.get(leg['option_type']+'s',[]) if c['instrument']==leg['instrument']),None)
+        if c is None:raise ValueError('EXACT_CONTRACT_UNAVAILABLE')
+        if c.get('bid') is None or c.get('ask') is None:raise ValueError('MISSING_BID_ASK')
+        if not 0<=c['bid']<=c['ask']:raise ValueError('CROSSED_QUOTE')
+        source=c.get('source_ms',surface.get('source_ms'))
+        if source is not None and source>at:raise ValueError('FUTURE_SOURCE_TIMESTAMP')
+        if not equity and (source is None or at-source>limit):raise ValueError('STALE_SOURCE')
+        c=execution_quote(c,surface,spot['price'])
+        out.append(dict(leg,bid=c['bid'],ask=c['ask'],price=c['ask'] if leg['side']=='BUY' else c['bid'],
+            source_ms=source,received_ms=surface['received_ms']))
+    return out
+
+
+def liquidation(legs,multiplier):
+    reverse=[dict(l,side='SELL' if l['side']=='BUY' else 'BUY',price=l['bid'] if l['side']=='BUY' else l['ask']) for l in legs]
+    costs=execution_cost(reverse,multiplier)
+    return dict(liquidation_credit=-costs['debit'],mid_value=sum((1 if l['side']=='BUY' else -1)*(l['bid']+l['ask'])/2*multiplier for l in legs),**costs)
 
 
 def historical_trades(tape,openings,progress=True):
-    store=open_store(tape,read_only=True);engine=Engine(store,persist=False);math_engine=MarketMath(engine)
-    seen=set();rows=[];excluded=Counter();surfaces={}
-    def surface_for(row):
-        raw_id=row.get('input_refs',{}).get('options')
-        if not raw_id or raw_id>row['raw_id']:return None
-        if raw_id not in surfaces:
-            raw=store.raw_record(raw_id)
-            if not raw or raw['received_ms']>row['timestamp_wall']:return None
-            engine.surfaces={};engine.spots={};engine.update_options(raw)
-            surfaces[raw_id]=copy.deepcopy(engine.surfaces)
+    store=open_store(tape,read_only=True);reader=HotTape(tape);engine=Engine(store,persist=False);math_engine=MarketMath(engine)
+    seen=set();rows=[];excluded=Counter();surfaces={};raw_cache={}
+    def raw(identity):
+        if identity not in raw_cache:
+            raw_cache[identity]=store.raw_record(identity)
+            if len(raw_cache)>512:raw_cache.pop(next(iter(raw_cache)))
+        return raw_cache[identity]
+    def surface_at(record,expiry=None):
+        if not record:return None
+        identity=record['id']
+        if identity not in surfaces:
+            engine.surfaces={};engine.spots={};engine.update_options(record)
+            surfaces[identity]=copy.deepcopy(engine.surfaces)
             if len(surfaces)>128:surfaces.pop(next(iter(surfaces)))
-        options=[s for (asset,expiry),s in surfaces[raw_id].items() if asset==row['asset'] and expiry>=row['expiry']]
-        return min(options,key=lambda s:s['expiry']) if options else None
+        choices=[s for (a,e),s in surfaces[identity].items() if a==record['subject'] and (expiry is None or e==expiry)]
+        return min(choices,key=lambda s:s['expiry']) if choices else None
+    def spot_at(asset,at,option_record):
+        if asset not in ('BTC','ETH'):
+            p=option_record['payload'];return dict(price=p.get('spot'),source_ms=p.get('spot_source_ms'),received_ms=option_record['received_ms'],raw_id=option_record['id'])
+        refs=reader.raw_refs('spot',asset,max(reader.start,at-60000),at)
+        if not refs:return None
+        r=raw(refs[0]['id']);p=r['payload'];return dict(price=number(p.get('price')),source_ms=timestamp(p.get('timestamp')) or r.get('source_ms'),received_ms=r['received_ms'],raw_id=r['id'])
+    def quote_at(trade,at,first=False):
+        refs=reader.raw_refs('options',trade['asset'],at if first else max(reader.start,at-120000),min(reader.end,at+600000) if first else at,first=first)
+        for ref in refs:
+            record=raw(ref['id']);surface=surface_at(record,trade['expiry']);timestamp=record['received_ms'] if first else at
+            spot=spot_at(trade['asset'],timestamp,record)
+            try:return exact_quotes(trade,surface,spot,timestamp),surface,spot,timestamp
+            except ValueError as error:excluded[str(error)]+=1
+        return None
     try:
         for index,opening in enumerate(openings):
             key=(opening['event_id'],opening['timestamp_wall']//86400000)
             if key in seen:continue
-            surface=surface_for(opening)
-            if not surface:excluded['NO_CAUSAL_SURFACE']+=1;continue
+            ref=opening.get('input_refs',{}).get('options')
+            if not ref or ref>opening['raw_id']:excluded['NO_CAUSAL_SURFACE']+=1;continue
+            record=raw(ref)
+            if not record or record['received_ms']>opening['timestamp_wall']:excluded['FUTURE_OPENING_QUOTE']+=1;continue
+            surface=surface_at(record)
+            choices=[s for (a,e),s in surfaces.get(ref,{}).items() if a==opening['asset'] and e>=opening['expiry']]
+            surface=min(choices,key=lambda s:s['expiry']) if choices else None
             result=math_engine.calculate(opening,surface,opening['timestamp_wall']);trade=result['trade']
             if not trade:excluded[result['trade_reason']]+=1;continue
-            if result['execution_state']=='MARKET_CLOSED':excluded['MARKET_CLOSED']+=1;continue
+            # First calibrated PM-helped expression per event/day, even if drag overwhelms it.
             seen.add(key)
-            for h,future in opening.get('_future',{}).items():
-                horizon=int(h);deadline=opening['timestamp_wall']+horizon*1000
-                if future['timestamp_wall']>deadline or deadline-future['timestamp_wall']>2000:excluded['MISSING_HORIZON']+=1;continue
-                exit_surface=surface_for(future)
-                if not exit_surface:excluded['MISSING_EXIT_SURFACE']+=1;continue
-                if exit_surface['expiry']!=trade['expiry']:excluded['EXACT_EXPIRY_NOT_RETAINED']+=1;continue
-                exit_legs=[]
-                for leg in trade['legs']:
-                    contract=next((c for c in exit_surface.get(leg['option_type']+'s',[]) if c['instrument']==leg['instrument']),None)
-                    if not contract or contract.get('bid') is None or contract.get('ask') is None or not 0<=contract['bid']<=contract['ask']:break
-                    contract=execution_quote(contract,exit_surface,future['spot'])
-                    side='SELL' if leg['side']=='BUY' else 'BUY'
-                    exit_legs.append(dict(leg,bid=contract['bid'],ask=contract['ask'],side=side,price=contract['bid'] if side=='SELL' else contract['ask']))
-                if len(exit_legs)!=len(trade['legs']):excluded['MISSING_EXACT_EXIT_QUOTES']+=1;continue
-                age_limit=120000 if surface['venue']=='yahoo' else 45000
-                if not 0<=deadline-exit_surface['received_ms']<=age_limit:excluded['EXIT_QUOTE_STALE']+=1;continue
-                close=execution_cost(exit_legs,trade['multiplier']);credit=-close['debit'];pnl=credit-trade['debit']
-                entry_mid=sum((1 if l['side']=='BUY' else -1)*(l['bid']+l['ask'])/2*trade['multiplier'] for l in trade['legs'])
-                exit_mid=sum((1 if l['side']=='SELL' else -1)*(l['bid']+l['ask'])/2*trade['multiplier'] for l in exit_legs)
-                rows.append(dict(event_id=opening['event_id'],block=str(key),asset=opening['asset'],event_type=opening['event_type'],
+            target=opening['timestamp_wall']+5000
+            if trade['multiplier']==100 and regular_session(opening['timestamp_wall'])['market_state']!='OPEN':target=next_open(opening['timestamp_wall'])+10000
+            entry=quote_at(trade,target,first=True)
+            if entry is None:excluded['NO_VALID_POST_LATENCY_ENTRY']+=1;continue
+            legs,entry_surface,entry_spot,entry_ms=entry
+            if entry_ms>=trade['expiry']:excluded['EXPIRY_BEFORE_ENTRY']+=1;continue
+            costs=execution_cost(legs,trade['multiplier'])
+            if costs['debit']<=0:excluded['NONPOSITIVE_ENTRY_DEBIT']+=1;continue
+            deadlines={'1800':entry_ms+1800000,'7200':entry_ms+7200000,'expiry':trade['expiry']}
+            if trade['multiplier']==100:
+                day=datetime.fromtimestamp(entry_ms/1000,ZoneInfo('America/New_York')).date();cal=calendar(day)
+                deadlines['session_close']=int(cal.session_close(day.isoformat()).timestamp()*1000)-1
+                deadlines['next_open']=next_open(entry_ms)+10000
+            for horizon,deadline in deadlines.items():
+                if deadline>reader.end:excluded['MISSING_'+horizon.upper()]+=1;continue
+                exit_surface=None;exit_raw=None
+                if horizon=='expiry':
+                    # An as-of recorded price is an explicitly labeled payoff proxy, not official settlement.
+                    refs=reader.raw_refs('spot' if trade['asset'] in ('BTC','ETH') else 'options',trade['asset'],deadline-120000,deadline)
+                    if not refs:excluded['SETTLEMENT_MISSING']+=1;continue
+                    settle_record=raw(refs[0]['id']);spot=spot_at(trade['asset'],deadline,settle_record)
+                    age=45000 if trade['asset'] in ('BTC','ETH') else 120000
+                    if not spot or spot.get('source_ms') is None or not 0<=deadline-spot['source_ms']<=age:excluded['SETTLEMENT_MISSING']+=1;continue
+                    credit=float(payoff(trade,np.array([spot['price']]))[0]);exit_fees=exit_slip=exit_spread=0;gross_exit=credit
+                    exit_raw=spot['raw_id'];actual_exit=deadline;quality='RECORDED_ASOF_SPOT_PAYOFF_PROXY'
+                else:
+                    if deadline>=trade['expiry']:excluded['OPTION_EXPIRED_BEFORE_'+horizon.upper()]+=1;continue
+                    out=quote_at(trade,deadline,first=horizon=='next_open')
+                    if out is None:excluded['MISSING_EXIT_'+horizon.upper()]+=1;continue
+                    exit_legs,exit_surface,spot,actual_exit=out;mark=liquidation(exit_legs,trade['multiplier']);credit=mark['liquidation_credit']
+                    exit_fees=mark['fees'];exit_slip=mark['slippage'];exit_spread=mark['spread_cost'];gross_exit=mark['mid_value'];exit_raw=exit_surface['raw_id'];quality='ACTUAL_BID_ASK_PROXY_QUOTES'
+                pnl=credit-costs['debit'];entry_mid=sum((1 if l['side']=='BUY' else -1)*(l['bid']+l['ask'])/2*trade['multiplier'] for l in legs)
+                rows.append(dict(event_id=opening['event_id'],block=str(key),asset=opening['asset'],event_type=opening['event_type'],provenance=opening['formation']['provenance'],
                     gap_bin=bin_gap(opening['gap_pp']),log_odds_bin=bin_odds(result['math']['log_odds_gap']),expression=trade['kind'],horizon=horizon,
-                    cost=trade['spread_cost']+trade['fees']+trade['slippage']+close['spread_cost']+close['fees']+close['slippage'],entry_debit=trade['debit'],pnl=pnl,roi=pnl/trade['debit'],gross_movement=exit_mid-entry_mid,
-                    opening_raw_id=opening['raw_id'],exit_raw_id=future['raw_id'],entry_surface_raw_id=surface['raw_id'],exit_surface_raw_id=exit_surface['raw_id']))
-            if progress and index%100==0:print(f'trade math: {index+1}/{len(openings)} openings, {len(rows)} causal exits',flush=True)
-    finally:store.close()
+                    cost=costs['spread_cost']+costs['fees']+costs['slippage']+exit_spread+exit_fees+exit_slip,entry_debit=costs['debit'],pnl=pnl,roi=pnl/costs['debit'],gross_movement=gross_exit-entry_mid,
+                    target_entry=target,entry_ms=entry_ms,entry_delay_ms=entry_ms-target,target_exit=deadline,actual_exit=actual_exit,quote_quality=quality,
+                    information_value=trade['information_value'],information_drag_ratio=trade['information_drag_ratio'],star_gap_pp=opening['gap_pp'],
+                    opening_raw_id=opening['raw_id'],entry_surface_raw_id=entry_surface['raw_id'],exit_raw_id=exit_raw,exact_legs=[(l['instrument'],l['side']) for l in trade['legs']]))
+            if progress and index%100==0:print(f'structure math: {index+1}/{len(openings)} openings, {len(rows)} fixed-horizon exits',flush=True)
+    finally:store.close();reader.close()
     def summary(group):
-        return dict(n_blocks=len({r['block'] for r in group}),trades=len(group),win_rate=sum(r['pnl']>0 for r in group)/len(group),
-            mean_pnl=float(np.mean([r['pnl'] for r in group])),median_pnl=float(np.median([r['pnl'] for r in group])),
-            total_cost=sum(r['cost'] for r in group),mean_gross_movement=float(np.mean([r['gross_movement'] for r in group])),
-            mean_net_movement=float(np.mean([r['pnl'] for r in group])),mean_roi=float(np.mean([r['roi'] for r in group])))
-    report=dict(mode='EXPLORATORY_HISTORICAL',selection='First eligible sampled opening per event/UTC-day; select highest modeled positive ROI; no threshold optimization',
-        cost_model='Actual entry ask/bid and exit bid/ask, plus 10bps slippage, size impact, 10bps fees and $0.65/leg each side',
-        missing=dict(excluded),opening_blocks=len(seen),horizons={},strata={},rows=rows)
-    for h in sorted({r['horizon'] for r in rows}):report['horizons'][str(h)]=summary([r for r in rows if r['horizon']==h])
-    for dimension in ('asset','event_type','gap_bin','log_odds_bin','expression'):
-        groups=defaultdict(list)
-        for r in rows:
-            if r['horizon']==1800:groups[r[dimension]].append(r)
-        report['strata'][dimension]={k:summary(v) for k,v in groups.items()}
+        if not group:return dict(n_blocks=0,status='MISSING')
+        return dict(n_blocks=len({r['block'] for r in group}),unique_events=len({r['event_id'] for r in group}),trades=len(group),win_rate=sum(r['pnl']>0 for r in group)/len(group),
+            mean_pnl=float(np.mean([r['pnl'] for r in group])),median_pnl=float(np.median([r['pnl'] for r in group])),total_cost=sum(r['cost'] for r in group),
+            mean_gross_movement=float(np.mean([r['gross_movement'] for r in group])),mean_roi=float(np.mean([r['roi'] for r in group])),
+            median_entry_delay_s=float(np.median([r['entry_delay_ms']/1000 for r in group])),status='EXPLORATORY' if len(group)>=10 else 'SMALL_SAMPLE')
+    report=dict(mode='EXPLORATORY_HISTORICAL',selection='First calibrated PM-helped candidate/event-day; rank information/drag with positive net-EV priority; freeze legs, then first valid options receipt after 5s / next XNYS open+10s',
+        holding_policy='30m and 2h as-of exits; session close-1ms; next-open first valid receipt after open+10s; recorded expiry payoff where available. No optimized exits.',
+        cost_model='Actual ask/bid; long-bid/short-ask exits + unchanged explicit fees/slippage/impact',missing=dict(excluded),opening_blocks=len(seen),horizons={},strata={},rows=rows)
+    for h in ('1800','7200','session_close','next_open','expiry'):report['horizons'][h]=summary([r for r in rows if r['horizon']==h])
+    for dimension in ('asset','event_type','gap_bin','log_odds_bin','provenance','expression'):
+        report['strata'][dimension]={}
+        for h in report['horizons']:
+            groups=defaultdict(list)
+            for r in rows:
+                if r['horizon']==h:groups[r[dimension]].append(r)
+            report['strata'][dimension][h]={k:summary(v) for k,v in groups.items()}
     return report

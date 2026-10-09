@@ -58,7 +58,7 @@ def watch(base):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='BASIS research and isolated paper execution; never real orders')
+    parser = argparse.ArgumentParser(description='BASIS source tape, gap math and independent starred signals; never orders')
     parser.add_argument('--db', default='data/basis.sqlite3')
     parser.add_argument('--url', default='http://127.0.0.1:8765')
     commands = parser.add_subparsers(dest='command', required=True)
@@ -78,7 +78,7 @@ def main():
     mapping = commands.add_parser('link'); mapping.add_argument('file', help='JSON mapping; append a versioned operator event')
     gaps=commands.add_parser('gaps',help='Exploratory continuous gap response and actual historical trade math')
     gaps.add_argument('--json',action='store_true');gaps.add_argument('--per-day',type=int,default=1)
-    gaps.add_argument('--output',default='data/gap-response.json');gaps.add_argument('--no-trade-math',action='store_true')
+    gaps.add_argument('--output',default='data/gap-shape.json');gaps.add_argument('--no-trade-math',action='store_true')
     gaps.add_argument('--from',dest='gap_start');gaps.add_argument('--to',dest='gap_end')
     math_command=commands.add_parser('math');math_command.add_argument('event_id')
     args = parser.parse_args()

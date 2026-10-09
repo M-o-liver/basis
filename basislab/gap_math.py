@@ -5,8 +5,8 @@ import numpy as np
 from .semantics import number, probability
 from .pricing import YEAR_MS, terminal_probability, touch_probability
 
-VERSION = 'gap-math-1.0'
-HORIZONS = (1, 5, 15, 30, 60, 300, 1800)
+VERSION = 'gap-math-2.0'
+HORIZONS = (1, 5, 15, 30, 60, 300, 1800, 7200)
 
 
 def logit(p, resolution=.001):
@@ -61,12 +61,28 @@ def vertical(lower, upper, kind, multiplier=100):
                 max_loss=cost['debit'], q_exec=cost['debit']/maximum)
 
 
-def binary_ev(p, trade):
-    q=trade['debit']/trade['max_payout'];ev=p*trade['max_payout']-trade['debit']
-    return dict(expected_payoff=p*trade['max_payout'],ev=ev,roi=ev/trade['debit'],
-                q_exec=q,pm_edge_pp=100*(p-q),binary_kelly=(p-q)/(1-q) if p>q and q<1 else 0,
-                payoff_method='BINARY_VERTICAL_APPROXIMATION',
-                approximation='Vertical has a ramp between strikes, not a binary payoff')
+def formation(current, prior, window_seconds=30):
+    """Descriptive contributions to new disagreement; no causal labels."""
+    result=dict(provenance='SLOW_DRIFT / MIXED',window_seconds=window_seconds,
+                delta_pm_pp=None,delta_opt_pp=None,spot_return=None,pm_created_gap_pp=0,
+                fresh_pm_unfollowed=False,reason='INSUFFICIENT_CAUSAL_LOOKBACK')
+    t=current['timestamp_wall'];target=t-window_seconds*1000
+    if prior is None or prior['timestamp_wall']>target or target-prior['timestamp_wall']>2000:return result
+    if any(prior.get(k)!=current.get(k) for k in ('event_id','mapping_hash')):return result
+    p,q,p0,q0=[probability(r.get(k)) for r,k in ((current,'pm_yes'),(current,'opt_yes'),(prior,'pm_yes'),(prior,'opt_yes'))]
+    if any(v is None for v in (p,q,p0,q0)):return result
+    dp,dq=100*(p-p0),100*(q-q0);g=100*(p-q);g0=100*(p0-q0);sign=1 if g>=0 else -1
+    travel=abs(dp)+abs(dq);share=abs(dp)/travel if travel else 0
+    spot=math.log(current['spot']/prior['spot']) if current.get('spot') and prior.get('spot') else None
+    widening=abs(g)-abs(g0);kind='SLOW_DRIFT / MIXED'
+    if spot is not None and abs(spot)>=.001 and dp*dq>0 and min(abs(dp),abs(dq))>=.02:kind='SPOT_COMMON_MOVE'
+    elif widening>=.10 and sign*dp>0 and share>=.75:kind='PM_CREATED'
+    elif widening>=.10 and -sign*dq>0 and 1-share>=.75:kind='OPT_CREATED'
+    fresh=kind=='PM_CREATED' and sign*dp>=.25 and max(0,sign*dq)<=.25*sign*dp
+    return dict(provenance=kind,window_seconds=window_seconds,delta_pm_pp=dp,delta_opt_pp=dq,
+                spot_return=spot,pm_travel=share if travel else None,opt_travel=1-share if travel else None,
+                abs_gap_change_pp=widening,pm_created_gap_pp=max(0,sign*dp) if kind=='PM_CREATED' else 0,
+                fresh_pm_unfollowed=fresh,prior_raw_id=prior.get('raw_id'),reason='DESCRIPTIVE_MOVEMENT')
 
 
 def reweight(p, hit_mean, no_hit_mean):
@@ -121,16 +137,26 @@ def payoff(trade, terminal):
     return result
 
 
-def conditional_ev(p, trade, paths):
+def conditional_ev(p, trade, paths, event_q=None):
     values=payoff(trade,paths['terminal']);hw,nw=paths['hit_weights'],paths['no_hit_weights']
     h=float(np.dot(hw,values)/hw.sum());n=float(np.dot(nw,values)/nw.sum())
-    expected=reweight(p,h,n);q=paths['q_model'];ev=expected-trade['debit']
+    expected=reweight(p,h,n);q=paths['q_model'] if event_q is None else event_q;ev=expected-trade['debit']
+    if probability(q) is None:raise ValueError('Invalid options event probability')
+    exit_legs=[dict(l,side='SELL' if l['side']=='BUY' else 'BUY',price=l['bid'] if l['side']=='BUY' else l['ask']) for l in trade['legs']]
+    exit_cost=execution_cost(exit_legs,trade['multiplier'])
+    entry_drag=trade['spread_cost']+trade['fees']+trade['slippage']
+    exit_drag=exit_cost['spread_cost']+exit_cost['fees']+exit_cost['slippage']
+    drag=entry_drag+exit_drag;information=(p-q)*(h-n)
     def se(w,mean):
         return math.sqrt(float(np.dot(w*w,(values-mean)**2)))/float(w.sum())
     error=math.sqrt((p*se(hw,h))**2+((1-p)*se(nw,n))**2)
     return dict(expected_payoff=expected,payoff_if_hit=h,payoff_if_no_hit=n,ev=ev,roi=ev/trade['debit'],
-                baseline_ev=reweight(q,h,n)-trade['debit'],pm_increment=(p-q)*(h-n),
-                mc_standard_error=error,mc_hit_se=se(hw,h),mc_no_hit_se=se(nw,n),q_path=q,q_sample=paths['q_sample'],
+                baseline_ev=reweight(q,h,n)-trade['debit'],pm_increment=information,information_value=information,
+                entry_drag=entry_drag,estimated_exit_drag=exit_drag,execution_drag=drag,
+                information_drag_ratio=information/drag if drag>0 else None,net_information_value=information-drag,
+                net_ev=ev-exit_drag,net_roi=(ev-exit_drag)/trade['debit'],
+                drag_assumption='Round-trip at current book; future exit friction is estimated, expiry cash payoff EV is separate',
+                mc_standard_error=error,mc_hit_se=se(hw,h),mc_no_hit_se=se(nw,n),q_event=q,q_path=paths['q_model'],q_sample=paths['q_sample'],
                 hit_effective_paths=paths['hit_effective_paths'],no_hit_effective_paths=paths['no_hit_effective_paths'],
                 paths=paths['paths'],payoff_method=paths['model'])
 

@@ -17,7 +17,7 @@ from .semantics import validate_mapping
 from .store import Store, encode
 from .tape import open_store
 from .market_math import MarketMath
-from .sim import Sim
+from .tracking import Tracker
 from .operations import Journal, RecorderMonitor
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -52,10 +52,10 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
     collector = Collector(engine, monitor)
     math_engine = MarketMath(engine)
     math_engine.start()
-    sim = Sim(math_engine, Path(db).with_suffix('.sim.sqlite3'))
-    sim.start()
+    tracker = Tracker(math_engine, Path(db).with_suffix('.stars.sqlite3'))
+    tracker.start()
 
-    history_path=Path(db).parent/'gap-response.json'
+    history_path=Path(db).parent/'gap-shape.json'
     history_cache={'mtime':None,'data':{}}
     def historical_match(row):
         try:
@@ -100,15 +100,15 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                 elif path.path == '/api/markets':
                     data = math_engine.snapshot()
                     fields = ('event_id','event_text','asset','expiry','event_type','direction','strike_or_threshold',
-                              'pm_yes','opt_yes','math','trade','trade_reason','execution_state')
+                              'pm_yes','opt_yes','math','trade','trade_reason','execution_state','formation','snapshot_id')
                     rows = [dict({k:r.get(k) for k in fields},history=historical_match(r)) for r in data['rows']]
                     self.send(200, dict(rows=rows, error=data['error'], collector=collector_state(),
-                        sources=engine.snapshot()['sources'],sim=dict(cash=sim.cash,account='BASIS SIM',error=sim.error)))
+                        sources=engine.snapshot()['sources'],tracking=tracker.snapshot()))
                 elif path.path == '/api/market':
                     event_id = q.get('event_id',[''])[0]
                     with math_engine.lock:row = math_engine.rows.get(event_id)
                     if row is None:raise ValueError('Explicit event_id is unavailable; select a current market')
-                    self.send(200, dict(row=dict(row,history=historical_match(row)),sim=sim.snapshot(event_id)))
+                    self.send(200, dict(row=dict(row,history=historical_match(row))))
                 elif path.path == '/api/gap-history':
                     event_id=q.get('event_id',[''])[0];minutes=int(q.get('minutes',[30])[0])
                     if not event_id or minutes not in (5,30,120):raise ValueError('Require event_id and 5, 30 or 120 minutes')
@@ -116,9 +116,11 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                     rows=store.history(event_id,now-minutes*60000,now,10000,tail=True)
                     step=max(1,len(rows)//720)
                     self.send(200,dict(rows=[dict(t=r['timestamp_wall'],pm=r.get('pm_yes'),opt=r.get('opt_yes'),gap=r.get('gap_pp')) for r in rows[::step]],reason='No recorded observations in this time window'))
-                elif path.path == '/api/sim/order':
-                    result=sim.order(q.get('order_id',[''])[0])
-                    self.send(200 if result else 404,result or dict(error='No such BASIS SIM order'))
+                elif path.path == '/api/stars':
+                    self.send(200,tracker.snapshot())
+                elif path.path == '/api/star':
+                    data=tracker.snapshot(q.get('tracking_id',[''])[0]);data['frozen']['snapshot']['history']=historical_match(data['frozen']['snapshot'])
+                    self.send(200,data)
                 elif path.path == '/api/health':
                     self.send(200,dict(ok=not(collector.failed or engine.persistence_error),collecting=collector_state()['running'],versions=engine.snapshot()['versions']))
                 else:
@@ -148,10 +150,12 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                 if size > 65536 or size <= 0:
                     raise ValueError('Body must be 1-65536 bytes')
                 payload = json.loads(self.rfile.read(size))
-                if self.path == '/api/sim/buy':
-                    self.send(200,sim.submit(payload))
-                elif self.path == '/api/sim/close':
-                    self.send(200,sim.close_position(payload['position_id']))
+                if self.path == '/api/star':
+                    self.send(200,tracker.create(payload['event_id'],payload['snapshot_id']))
+                elif self.path == '/api/star/stop':
+                    self.send(200,tracker.finish(payload['tracking_id']))
+                elif self.path == '/api/star/remove':
+                    self.send(200,tracker.remove(payload['tracking_id']))
                 elif self.path == '/api/mapping':
                     event = validate_mapping(payload)
                     raw_id = engine.ingest('operator', 'mapping', event['event_id'], event)
@@ -199,7 +203,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
         journal.record('service_stop', session=engine.session, raw_id=engine.last_raw_id, pid=os.getpid(),
                        reason=reason, error=collector.failed or engine.persistence_error,
                        min_free_mb=engine.config.min_free_mb)
-        httpd.server_close(); sim.close(); math_engine.close(); collector.close()
+        httpd.server_close(); tracker.close(); math_engine.close(); collector.close()
         monitor.checkpoint()
         journal.record('service_stopped', session=engine.session, raw_id=engine.last_raw_id, reason=reason)
         store.close(); journal.close(); lock.close()

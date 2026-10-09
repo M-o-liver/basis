@@ -84,3 +84,9 @@ operational gates or claim an informational/trading edge.
 ## 2026-10-08 — Markets / gap-math reset
 
 Active exotic analyzers, evaluation worker and old paper-policy/wallet runtime are retired. Historical raw tape, frames, records, source-code archives, old paper database and frozen prospective sidecar remain. The live product is one market table plus concrete option payoff math and operator-only BASIS SIM. Probability-1.3.0 explicitly versions the seven-day Yahoo equity IV proxy. This does not retroactively pass earlier acceptance gates or establish information edge. See [reset measurements and verification](gap-response-2026-10-08.md).
+
+## 2026-10-09 — gap shape / starred signals
+
+The [dated gap-shape report](gap-shape-2026-10-08.md) adds nonlinear response, prior-only formation, censored lifetimes and actual conditional option payoffs. It preserves the earlier numerical and operational findings. Funded BASIS SIM is retired from the product; its database remains preserved. Stars freeze exact signals/contracts and mark ordinary-latency executable returns without wallets or orders.
+
+**PASS (bounded):** 65 tests; real ETH delayed-entry/return graph; isolated WAITING/LIVE/ENDED restart; two archived/current replay regions, 114 exact observations and zero mismatches; active integrity `ok`, 108 closed-segment integrity records reused; frozen v1/wallet/prospective/SIM file identities preserved; one supervised collector. **PARTIAL:** production catalog and old reference-history source limitations remain explicit. **NOT YET ELAPSED / UNPROVEN:** a real closed-stock next-open entry, long star holding and official expiry settlement. No 24h/72h/7d gate is advanced by this short interaction pass.

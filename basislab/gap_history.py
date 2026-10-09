@@ -9,10 +9,11 @@ from pathlib import Path
 import sqlite3
 import time
 import numpy as np
-from .gap_math import HORIZONS, horizon_outcome, logit
+from .gap_math import HORIZONS, horizon_outcome, logit, formation
 from .store import decode, encode
 
-VERSION='gap-response-1.0'
+VERSION='gap-response-2.0'
+from .gap_shape import response_curve, response_model, hazard_summary
 DAY=86400000
 
 
@@ -43,7 +44,10 @@ class HotTape:
         first=db.execute(f'SELECT id,{column} FROM {table} ORDER BY id LIMIT 1').fetchone()
         last=db.execute(f'SELECT id,{column} FROM {table} '+('WHERE id<=? ' if limit else '')+'ORDER BY id DESC LIMIT 1',(limit,) if limit else ()).fetchone()
         if not first or not last:db.close();return
-        self.sources.append(dict(db=db,path=str(path),v2=v2,table=table,column=column,first_id=first[0],last_id=last[0],first_ms=first[1],last_ms=last[1]))
+        raw_table='records' if v2 else 'raw'
+        raw_first=db.execute(f'SELECT id,received_ms FROM {raw_table} ORDER BY id LIMIT 1').fetchone()
+        raw_last=db.execute(f'SELECT id,received_ms FROM {raw_table} ORDER BY id DESC LIMIT 1').fetchone()
+        self.sources.append(dict(db=db,path=str(path),v2=v2,table=table,column=column,first_id=first[0],last_id=last[0],first_ms=first[1],last_ms=last[1],raw_table=raw_table,raw_first=raw_first[0],raw_last=raw_last[0],raw_first_ms=raw_first[1],raw_last_ms=raw_last[1]))
 
     def close(self):
         for s in self.sources:s['db'].close()
@@ -51,8 +55,25 @@ class HotTape:
     def native(self,scope,start,end):
         for s in self.sources:
             if not s['v2'] or s['last_ms']<start or s['first_ms']>end:continue
-            for r in s['db'].execute("SELECT raw_id,timestamp_ms,kind,before_value,after_value FROM salient WHERE scope=? AND timestamp_ms BETWEEN ? AND ? AND kind IN ('pm_jump','opt_jump') ORDER BY timestamp_ms,raw_id",(scope,start,end)):
-                yield dict(raw_id=r['raw_id'],timestamp=r['timestamp_ms'],leg=r['kind'][:-5],before=decode(r['before_value']),after=decode(r['after_value']))
+            for r in s['db'].execute("SELECT a.raw_id,a.timestamp_ms,a.kind,a.before_value,a.after_value,st.source,st.kind trigger_kind,r.source_ms FROM salient a JOIN records r ON r.id=a.raw_id JOIN streams st ON st.id=r.stream_id WHERE a.scope=? AND a.timestamp_ms BETWEEN ? AND ? AND a.kind IN ('pm_jump','opt_jump') ORDER BY a.timestamp_ms,a.raw_id",(scope,start,end)):
+                yield dict(raw_id=r['raw_id'],timestamp=r['timestamp_ms'],leg=r['kind'][:-5],before=decode(r['before_value']),after=decode(r['after_value']),trigger_source=r['source'],trigger_kind=r['trigger_kind'],source_ms=r['source_ms'])
+
+    def raw_refs(self,kind,subject,start,end,first=False):
+        candidates=[]
+        for s in (self.sources if first else reversed(self.sources)):
+            if s['raw_first_ms']>end or s['raw_last_ms']<start:continue
+            db=s['db'];table=s['raw_table']
+            lo=lower_id(db,table,'received_ms',start,s['raw_first'],s['raw_last']+1)
+            hi=lower_id(db,table,'received_ms',end+1,lo,s['raw_last']+1)
+            direction='ASC' if first else 'DESC'
+            if s['v2']:
+                streams=[r[0] for r in db.execute('SELECT id FROM streams WHERE kind=? AND subject=?',(kind,subject))]
+                for stream in streams:
+                    candidates.extend(dict(r) for r in db.execute(f'SELECT id,received_ms FROM records INDEXED BY record_stream WHERE stream_id=? AND id>=? AND id<? AND received_ms BETWEEN ? AND ? ORDER BY id {direction} LIMIT 64',(stream,lo,hi,start,end)))
+            else:
+                candidates.extend(dict(r) for r in db.execute(f'SELECT id,received_ms FROM raw INDEXED BY raw_kind WHERE kind=? AND subject=? AND id>=? AND id<? AND received_ms BETWEEN ? AND ? ORDER BY id {direction} LIMIT 64',(kind,subject,lo,hi,start,end)))
+            if candidates and not first:break
+        return sorted({r['id']:r for r in candidates}.values(),key=lambda r:r['id'],reverse=not first)
 
     def rows(self,start,end):
         for s in self.sources:
@@ -96,7 +117,7 @@ def windows(start,end,per_day=1):
     result={(start,min(end,start+3600000)),(max(start,end-3600000),end)}
     for day in range(start//DAY,end//DAY+1):
         for i in range(per_day):
-            offset=int.from_bytes(hashlib.sha256(f'{VERSION}:{day}:{i}'.encode()).digest()[:8],'big')%(23*3600000)
+            offset=int.from_bytes(hashlib.sha256(f'gap-response-1.0:{day}:{i}'.encode()).digest()[:8],'big')%(23*3600000)
             a=max(start,day*DAY+offset);b=min(end,a+3600000)
             if b-a>=1800000:result.add((a,b))
     # Merge overlaps so the same opening never enters twice.
@@ -136,8 +157,8 @@ def block_summary(rows):
         opt_toward_rate=float(means[0]),pm_toward_rate=float(means[1]),mean_opt_move_pp=float(means[2]),
         mean_pm_move_pp=float(means[3]),mean_convergence_pp=float(means[4]),
         median_opt_move_pp=float(np.median([r['opt_toward'] for r in rows])),
-        mean_opt_close_fraction=float(np.mean([r['opt_fraction'] for r in fractions])) if fractions else None,
-        mean_pm_close_fraction=float(np.mean([r['pm_fraction'] for r in fractions])) if fractions else None,
+        mean_opt_close_fraction=float(np.mean([np.mean([r['opt_fraction'] for r in group if abs(r['gap_pp'])>=.1]) for group in clusters.values() if any(abs(r['gap_pp'])>=.1 for r in group)])) if fractions else None,
+        mean_pm_close_fraction=float(np.mean([np.mean([r['pm_fraction'] for r in group if abs(r['gap_pp'])>=.1]) for group in clusters.values() if any(abs(r['gap_pp'])>=.1 for r in group)])) if fractions else None,
         fraction_min_opening_gap_pp=.1,ci95_event_day_bootstrap=ci,
         ci_columns=['opt_toward_rate','pm_toward_rate','mean_opt_move_pp','mean_pm_move_pp','mean_convergence_pp'],
         no_opt_movement_rate=sum(r['opt_toward']==0 for r in rows)/len(rows),
@@ -171,35 +192,16 @@ def regression(rows,contemporaneous_spot=False):
     return result
 
 
-def lifecycle_summary(rows):
-    clusters=defaultdict(list)
-    for r in rows:clusters[r['block']].append(r)
-    if not clusters:return dict(n_blocks=0,half_life_s=None,status='INSUFFICIENT_CONTINUOUS_HISTORY')
-    weighted=[];reach=close=widen=double=0
-    for group in clusters.values():
-        weight=1/(len(group)*len(clusters))
-        for r in group:
-            if r['half_life_s'] is not None:weighted.append((r['half_life_s'],weight));reach+=weight
-            close+=weight*r['close_before_double'];widen+=weight*r['close_before_widening'];double+=weight*r['doubled']
-    cumulative=0;median=None
-    for value,weight in sorted(weighted):
-        cumulative+=weight
-        if cumulative>=.5:median=value;break
-    return dict(n_blocks=len(clusters),observations=len(rows),half_life_s=median,half_reached_rate=reach,
-                p_close_before_double=close,p_close_before_widening=widen,p_gap_doubles=double,
-                median_time_to_max_s=float(np.median([np.median([r['time_to_max_s'] for r in group]) for group in clusters.values()])),
-                status='OBSERVED' if median is not None else 'MEDIAN_NOT_REACHED_WITHIN_30M')
-
-
-def study(tape,per_day=1,stride_seconds=60,start=None,end=None,progress=True):
+def study(tape,per_day=1,stride_seconds=60,start=None,end=None,progress=True,cache_path=None):
     started=time.monotonic();reader=HotTape(tape)
     start=max(reader.start,start or reader.start);end=min(reader.end,end or reader.end)
-    plan=windows(start,end,per_day);outcomes=defaultdict(list);life=[];event_studies=defaultdict(list)
-    scanned=0;excluded=Counter();trade_openings=[]
-    try:
-        for region,(a,b) in enumerate(plan):
+    plan=windows(start,end,per_day);outcomes=defaultdict(list);life=[];impulses=defaultdict(list)
+    scanned=0;excluded=Counter();trade_openings=[];seen_open=set();seen_life=set()
+    for region,(a,b) in enumerate(plan):
+        try:
             panel=defaultdict(list)
-            for r in reader.rows(a,b):
+            follow_end=min(end,b+7200000)
+            for r in reader.rows(max(reader.start,a-60000),follow_end):
                 scanned+=1
                 if r.get('source_state') not in ('OK','PROXY','CLOSED') or 'WIDE_PM_BOOK' in r.get('quality_flags',[]):
                     excluded[r.get('source_state','UNKNOWN')]+=1;continue
@@ -208,130 +210,140 @@ def study(tape,per_day=1,stride_seconds=60,start=None,end=None,progress=True):
                 panel[key].append(r)
             for key,rows in panel.items():
                 rows.sort(key=lambda r:(r['timestamp_wall'],r['raw_id'],r['id']));times=[r['timestamp_wall'] for r in rows]
-                causal_keys=[(r['timestamp_wall'],r['raw_id']) for r in rows]
-                for jump in reader.native(key[0],a,b):
-                    i=bisect_right(causal_keys,(jump['timestamp'],jump['raw_id']))-1
-                    if i<0 or jump['timestamp']-times[i]>2000:continue
-                    opening=rows[i];leg=jump['leg'];other='opt' if leg=='pm' else 'pm';delta=jump['after']-jump['before']
-                    if not delta:continue
-                    for h in HORIZONS[:-1]:
-                        deadline=jump['timestamp']+h*1000;j=bisect_right(times,deadline)-1
-                        if deadline>b or j<i or deadline-times[j]>2000:continue
-                        move=(1 if delta>0 else -1)*(rows[j][other+'_yes']-opening[other+'_yes'])*100
-                        event_studies[(leg,h)].append(dict(block=key[0]+':'+str(jump['timestamp']//DAY),event_id=key[0],opt_toward=move,pm_toward=0,convergence=move,opt_fraction=0,pm_fraction=0,gap_pp=0))
-                next_open=a;next_trade=a;previous=None
-                for i,r in enumerate(rows):
-                    t=r['timestamp_wall'];gap=100*(r['pm_yes']-r['opt_yes']);z=logit(r['pm_yes'])-logit(r['opt_yes'])
-                    block=r['event_id']+':'+str(t//DAY)
-                    previous=r
-                    if t<next_open or gap==0:continue
-                    next_open=t+stride_seconds*1000
-                    prior=bisect_right(times,t-60000)-1
-                    spot_recent=math.log(r['spot']/rows[prior]['spot']) if prior>=0 and t-60000-times[prior]<=2000 else None
-                    meta=dict(event_id=r['event_id'],block=block,asset=r['asset'],event_type=r['event_type'],direction=r['direction'],
+                causal_keys=[(r['timestamp_wall'],r['raw_id']) for r in rows];gap_values=np.array([100*(r['pm_yes']-r['opt_yes']) for r in rows])
+                breaks=np.flatnonzero(np.diff(times)>5000)+1
+                def metadata(r,i):
+                    t=r['timestamp_wall'];gap=100*(r['pm_yes']-r['opt_yes']);prior=bisect_right(times,t-30000)-1
+                    recent=formation(r,rows[prior] if prior>=0 else None)
+                    before=bisect_right(times,t-60000)-1
+                    spot_recent=math.log(r['spot']/rows[before]['spot']) if before>=0 and t-60000-times[before]<=2000 else None
+                    return dict(event_id=r['event_id'],block=r['event_id']+':'+str(t//DAY),asset=r['asset'],event_type=r['event_type'],direction=r['direction'],
                         asset_class='crypto' if r['asset'] in ('BTC','ETH') else 'equity',regime=r.get('regime'),
                         probability_bucket='tail<5%' if min(r['pm_yes'],r['opt_yes'])<.05 else 'middle5-95%' if max(r['pm_yes'],r['opt_yes'])<.95 else 'tail>95%',
                         expiry_bucket='<1day' if r['expiry']-t<DAY else '1-7days' if r['expiry']-t<7*DAY else '7days+',
-                        gap_pp=gap,z=z,spot_recent=spot_recent,iv=r.get('local_iv'),tte_days=(r['expiry']-t)/DAY,
-                        distance=math.log(r['strike_or_threshold']/r['spot']))
+                        gap_pp=gap,z=logit(r['pm_yes'])-logit(r['opt_yes']),spot_recent=spot_recent,iv=r.get('local_iv'),tte_days=(r['expiry']-t)/DAY,
+                        distance=math.log(r['strike_or_threshold']/r['spot']),**recent)
+                for jump in reader.native(key[0],a,b):
+                    i=bisect_right(causal_keys,(jump['timestamp'],jump['raw_id']-1))-1
+                    if i<0 or jump['timestamp']-times[i]>2000 or abs(jump['after']-jump['before'])*100<.25:continue
+                    base=rows[i];leg=jump['leg'];other='opt' if leg=='pm' else 'pm';delta=jump['after']-jump['before']
+                    opening=dict(base,timestamp_wall=jump['timestamp'],raw_id=jump['raw_id'],**{leg+'_yes':jump['after']})
+                    meta=metadata(opening,i);meta.update(jump_pp=100*delta,jump_bin='.25-.5pp' if abs(delta)<.005 else '.5-1pp' if abs(delta)<.01 else '1-2pp' if abs(delta)<.02 else '2pp+',
+                        gap_bin=bin_gap(meta['gap_pp']),trigger_source=jump['trigger_source'],trigger_kind=jump['trigger_kind'])
+                    for h in HORIZONS[:-1]:
+                        deadline=jump['timestamp']+h*1000;j=bisect_right(times,deadline)-1
+                        if j<i:continue
+                        out=horizon_outcome(opening,rows[j],deadline)
+                        if out is None or deadline>follow_end:continue
+                        move=(1 if delta>0 else -1)*(rows[j][other+'_yes']-base[other+'_yes'])*100
+                        impulses[(leg,h)].append(dict(meta,opt_toward=move,pm_toward=0,convergence=move,opt_fraction=0,pm_fraction=0,
+                            opening_raw_id=jump['raw_id'],preceding_raw_id=base['raw_id'],pm_before=jump['before'] if leg=='pm' else base['pm_yes'],
+                            pm_after=opening['pm_yes'],opt_before=jump['before'] if leg=='opt' else base['opt_yes'],opt_after=opening['opt_yes'],spot_star=base['spot']))
+                next_open=a;next_trade=a;next_life=a
+                for i,r in enumerate(rows):
+                    t=r['timestamp_wall']
+                    if not a<=t<=b or t<next_open or r['pm_yes']==r['opt_yes']:continue
+                    identity=(key,r['raw_id'])
+                    if identity in seen_open:continue
+                    seen_open.add(identity);next_open=t+stride_seconds*1000;meta=metadata(r,i)
                     for h in HORIZONS:
                         deadline=t+h*1000;j=bisect_right(times,deadline)-1
                         out=horizon_outcome(r,rows[j] if j>=i else None,deadline)
-                        if out is not None and deadline<=b:outcomes[h].append(dict(out,**meta))
+                        if out is not None and deadline<=follow_end:outcomes[h].append(dict(out,**meta))
                         else:excluded['MISSING_HORIZON_'+str(h)]+=1
                     if t>=next_trade and r.get('input_refs',{}).get('options'):
-                        opening=dict(r,gap_pp=gap,model_inputs=dict(iv=r.get('local_iv')))
-                        opening['_future']={}
-                        for h in HORIZONS:
-                            j=bisect_right(times,t+h*1000)-1
-                            if j>=i and t+h*1000<=b and t+h*1000-times[j]<=2000:
-                                opening['_future'][str(h)]=dict(rows[j])
-                        trade_openings.append(opening);next_trade=t+1800000
-                    # Half-life and full-close/double are censored at 30m, never
-                    # reported only among successes. Sub-.1pp gaps keep responses.
-                    if abs(gap)>=.1:
-                        stop=bisect_right(times,min(b,t+1800000));future=rows[i+1:stop]
-                        continuous=bool(future) and all(right['timestamp_wall']-left['timestamp_wall']<=5000 for left,right in zip([r]+future,future))
-                        half=close=double=widen=None;peak=abs(gap);peak_at=t
-                        if continuous:
-                            for f in future:
-                                g=100*(f['pm_yes']-f['opt_yes']);dt=(f['timestamp_wall']-t)/1000
-                                if abs(g)<=abs(gap)/2 and half is None:half=dt
-                                if (g*gap<=0 or abs(g)<=.01) and close is None:close=dt
-                                if abs(g)>=2*abs(gap) and double is None:double=dt
-                                if abs(g)>abs(gap)+1e-9 and widen is None:widen=dt
-                                if abs(g)>peak:peak=abs(g);peak_at=f['timestamp_wall']
-                        full=continuous and b>=t+1800000 and future[-1]['timestamp_wall']>=t+1798000
-                        life.append(dict(block=block,event_id=r['event_id'],half_life_s=half,close_before_double=close is not None and (double is None or close<double),
-                            close_before_widening=close is not None and (widen is None or close<widen),
-                            asset=r['asset'],event_type=r['event_type'],direction=r['direction'],
-                            doubled=double is not None,time_to_max_s=(peak_at-t)/1000,full_followup=full,gap_bin=bin_gap(gap)))
-            if progress:print(f'gap research: region {region+1}/{len(plan)}, {scanned:,} usable candidate frames read',flush=True)
-    finally:reader.close()
+                        opening=dict(r,gap_pp=meta['gap_pp'],model_inputs=dict(iv=r.get('local_iv')),formation={k:meta[k] for k in ('provenance','fresh_pm_unfollowed','delta_pm_pp','delta_opt_pp','spot_return')})
+                        trade_openings.append(opening);next_trade=t+300000
+                    if t<next_life or abs(meta['gap_pp'])<.1 or identity in seen_life:continue
+                    next_life=t+300000;seen_life.add(identity)
+                    stop=bisect_right(times,min(t+7200000,r['expiry']));bad=breaks[breaks>i]
+                    reason='HORIZON_COMPLETE'
+                    if len(bad) and bad[0]<stop:stop=int(bad[0]);reason='SOURCE_OR_RECORDING_GAP'
+                    elif stop and times[stop-1]<t+7198000:reason='EXPIRY' if r['expiry']<=t+7200000 else 'END_OF_AVAILABLE_HISTORY'
+                    g=gap_values[i:stop];elapsed=(np.asarray(times[i:stop])-t)/1000;absolute=abs(g);size=abs(meta['gap_pp'])
+                    first=lambda mask:float(elapsed[np.flatnonzero(mask)[0]]) if mask.any() else None
+                    peak=int(np.argmax(absolute)) if len(g) else 0
+                    life.append(dict(meta,gap_bin=bin_gap(size),log_odds_bin=bin_odds(meta['z']),close25_s=first(absolute<=.75*size),
+                        half_s=first(absolute<=.5*size),full_s=first((g*meta['gap_pp']<=0)|(absolute<=.01)),double_s=first(absolute>=2*size),
+                        censor_s=max(0,min(7200,(follow_end-t)/1000,(r['expiry']-t)/1000,float(elapsed[-1])+2)) if len(elapsed) else 0,censor_reason=reason,time_to_max_s=float(elapsed[peak]) if len(elapsed) else None))
+            if progress:print(f'gap shape: region {region+1}/{len(plan)}, {scanned:,} frames including lookback/follow-up',flush=True)
+        except Exception:
+            reader.close();raise
+    reader.close()
+    if cache_path:
+        import zlib
+        payload=dict(start=start,end=end,per_day=per_day,stride_seconds=stride_seconds,plan=plan,
+            outcomes={str(k):v for k,v in outcomes.items()},life=life,impulses={f'{leg}:{h}':v for (leg,h),v in impulses.items()},
+            scanned=scanned,excluded=dict(excluded),trade_openings=trade_openings,opening_count=len(seen_open),data_read_seconds=time.monotonic()-started)
+        Path(cache_path).write_bytes(zlib.compress(encode(payload).encode(),3))
+    return summarize(dict(start=start,end=end,per_day=per_day,stride_seconds=stride_seconds,plan=plan,outcomes=outcomes,life=life,
+        impulses=impulses,scanned=scanned,excluded=excluded,trade_openings=trade_openings,opening_count=len(seen_open),data_read_seconds=time.monotonic()-started))
+
+
+def summarize(data):
+    started=time.monotonic()
+    start,end,per_day,stride_seconds,plan,life,scanned,excluded,trade_openings=[data[k] for k in ('start','end','per_day','stride_seconds','plan','life','scanned','excluded','trade_openings')]
+    outcomes=defaultdict(list,{int(h):rows for h,rows in data['outcomes'].items()})
+    impulses={(k if isinstance(k,tuple) else (k.split(':')[0],int(k.split(':')[1]))):rows for k,rows in data['impulses'].items()}
     report=dict(version=VERSION,mode='EXPLORATORY_HISTORICAL',created_ms=time.time_ns()//1000000,start_ms=start,end_ms=end,
-        selection=f'Deterministic {per_day} 1h window(s) per UTC day, earliest and latest; all nonzero usable gaps in each window; {stride_seconds}s openings; no episode threshold',
-        windows=plan,frame_records_read=scanned,excluded=dict(excluded),sampling_stride_seconds=stride_seconds,
-        unit='Event/UTC-day blocks; repeated openings are clustered, not independent discoveries',
-        probability_resolution=.001,horizons={str(h):block_summary(outcomes[h]) for h in HORIZONS},
-        regressions={str(h):regression(outcomes[h]) for h in HORIZONS},spot_conditioned={str(h):regression(outcomes[h],True) for h in HORIZONS},
-        edge_surface={},strata={},stratified_horizons={},event_studies={},comparables={},seconds=time.monotonic()-started)
-    thirty=outcomes[1800]
-    for dimension,function in [('gap_pp',lambda r:bin_gap(r['gap_pp'])),('log_odds_gap',lambda r:bin_odds(r['z']))]:
+        selection=f'Deterministic {per_day} 1h opening window(s)/UTC day + earliest/latest; 60s lookback and up to 2h follow-up; all nonzero usable gaps; {stride_seconds}s opening stride; 300s hazard stride',
+        windows=plan,frame_records_read=scanned,opening_count=data['opening_count'],unique_events=len({r['event_id'] for rows in outcomes.values() for r in rows}),
+        event_day_blocks=len({r['block'] for rows in outcomes.values() for r in rows}),excluded=dict(excluded),sampling_stride_seconds=stride_seconds,
+        unit='Event/UTC-day blocks; overlapping windows deduplicated; repeated frames are not independent discoveries',
+        formation_rules=dict(window_seconds=30,widening_pp=.10,dominant_travel=.75,fresh_pm_pp=.25,opt_followed_fraction_max=.25,spot_common_log_return=.001,both_common_min_pp=.02,causal_claim=False),
+        probability_resolution=.001,horizons={str(h):block_summary(outcomes[h]) for h in HORIZONS},response_curves={},controlled_curves={},edge_surface={},strata={},
+        gap_provenance={},event_studies={},event_study_strata={},conditional_hazards={},comparables={})
+    for h,rows in outcomes.items():
+        report['response_curves'][str(h)]={axis:response_curve(rows,axis) for axis in ('gap_pp','z')}
+        report['controlled_curves'][str(h)]={axis:dict(prediction_time=response_model(rows,axis),ex_post_spot=response_model(rows,axis,True)) for axis in ('gap_pp','z')}
         buckets=defaultdict(list)
-        for r in thirty:buckets[function(r)].append(r)
-        report['edge_surface'][dimension]={k:block_summary(v) for k,v in sorted(buckets.items())}
-    for dimension in ('asset','asset_class','event_type','direction','probability_bucket','expiry_bucket','regime'):
+        for r in rows:buckets[r['provenance']].append(r)
+        report['gap_provenance'][str(h)]={k:block_summary(v) for k,v in buckets.items()}
+        report['gap_provenance'][str(h)]['LARGE_FRESH_PM_UNFOLLOWED']=block_summary([r for r in rows if abs(r['gap_pp'])>=4 and r['fresh_pm_unfollowed']])
+    thirty=outcomes[1800]
+    for dimension in ('gap_pp','z'):
+        func=bin_gap if dimension=='gap_pp' else bin_odds;buckets=defaultdict(list)
+        for r in thirty:buckets[func(r[dimension])].append(r)
+        report['edge_surface'][dimension]={k:block_summary(v) for k,v in buckets.items()}
+    for dimension in ('asset','asset_class','event_type','direction','probability_bucket','expiry_bucket','regime','provenance'):
         buckets=defaultdict(list)
         for r in thirty:buckets[str(r[dimension])].append(r)
-        report['strata'][dimension]={k:block_summary(v) for k,v in sorted(buckets.items())}
+        report['strata'][dimension]={k:block_summary(v) for k,v in buckets.items()}
     buckets=defaultdict(list)
     for r in thirty:buckets['|'.join((r['asset'],r['event_type'],r['direction'],bin_gap(r['gap_pp'])))].append(r)
-    report['comparables']={key:block_summary(rows) for key,rows in buckets.items()}
-    for dimension in ('asset','asset_class','event_type','direction','probability_bucket','expiry_bucket','regime','gap_bin','log_odds_bin'):
-        dimension_results={}
-        for horizon,rows in outcomes.items():
-            buckets=defaultdict(list)
-            for r in rows:
-                key=bin_gap(r['gap_pp']) if dimension=='gap_bin' else bin_odds(r['z']) if dimension=='log_odds_bin' else str(r[dimension])
-                buckets[key].append(r)
-            dimension_results[str(horizon)]={}
-            for key,group in buckets.items():
-                count=len({r['block'] for r in group})
-                dimension_results[str(horizon)][key]=dict(response=block_summary(group),error_correction=regression(group)) if count>=10 else dict(n_blocks=count,status='INSUFFICIENT_STRATUM')
-        report['stratified_horizons'][dimension]=dimension_results
-    report['quote_scale_sensitivity']={str(h):regression([r for r in rows if all(.001<=r[k]<=.999 for k in ('p0','q0','p1','q1'))],True) for h,rows in outcomes.items()}
-    report['quote_scale_sensitivity_definition']='Separate sensitivity fit with all opening/horizon probabilities in [.001,.999]. Raw interior probabilities remain unchanged in the main fit; endpoints alone are clipped.'
-    for (leg,h),rows in event_studies.items():report['event_studies'].setdefault(leg,{})[str(h)]=block_summary(rows)
-    report['event_study_timing']='Exact v2 native salient jump timestamps/raw boundaries. Other leg uses causal preceding frame (<=2s); outcomes use as-of frames. Legacy has no salient stream and is excluded from native studies.'
-    complete=[r for r in life if r['full_followup']];halves=[r['half_life_s'] for r in complete if r['half_life_s'] is not None]
-    # Kaplan-Meier median: if fewer than half reached half-gap, median is not observed.
-    report['lifecycle']=dict(openings=len(life),complete_30m_followup=len(complete),n_blocks=len({r['block'] for r in complete}),max_valid_frame_gap_ms=5000,
-        half_reached_rate=len(halves)/len(complete) if complete else None,
-        median_half_life_s=float(np.quantile(halves,.5*len(complete)/len(halves))) if halves and len(halves)>=len(complete)/2 else None,
-        median_status='OBSERVED' if halves and len(halves)>=len(complete)/2 else 'NOT_REACHED_WITHIN_30M',
-        p_close_before_double=sum(r['close_before_double'] for r in complete)/len(complete) if complete else None,
-        p_gap_doubles=sum(r['doubled'] for r in complete)/len(complete) if complete else None,
-        median_time_to_max_s=float(np.median([r['time_to_max_s'] for r in complete])) if complete else None)
-    report['lifecycle'].update(lifecycle_summary(complete))
+    report['comparables']={k:block_summary(v) for k,v in buckets.items()}
+    report['lifecycle']=hazard_summary(life)
+    for dimension in ('gap_bin','log_odds_bin','provenance'):
+        buckets=defaultdict(list)
+        for r in life:buckets[r[dimension]].append(r)
+        report['conditional_hazards'][dimension]={k:hazard_summary(v) for k,v in buckets.items()}
     for key,summary in report['comparables'].items():
-        asset,kind,direction,gap_bin=key.split('|')
-        subset=[r for r in complete if r['gap_bin']==gap_bin and r['asset']==asset and r['event_type']==kind and r['direction']==direction]
-        summary['lifecycle']=lifecycle_summary(subset)
-        summary['half_life_s']=summary['lifecycle']['half_life_s']
-    report['_trade_openings']=trade_openings
+        asset,kind,direction,gap_bin=key.split('|');subset=[r for r in life if r['asset']==asset and r['event_type']==kind and r['direction']==direction and r['gap_bin']==gap_bin]
+        summary['lifecycle']=hazard_summary(subset);summary['half_life_s']=summary['lifecycle'].get('median_half_life_s')
+    for (leg,h),rows in impulses.items():
+        report['event_studies'].setdefault(leg,{})[str(h)]=block_summary(rows)
+        target=report['event_study_strata'].setdefault(leg,{}).setdefault(str(h),{})
+        for dimension in ('gap_bin','jump_bin','event_type','probability_bucket','expiry_bucket','trigger_source'):
+            buckets=defaultdict(list)
+            for r in rows:buckets[str(r[dimension])].append(r)
+            target[dimension]={k:block_summary(v) for k,v in buckets.items()}
+    report['event_study_timing']='Exact native receipt timestamp/raw ID; other leg/spot from strictly preceding causal frame <=2s old; post-jump PM/OPT from native values, not a later frame; OPT jumps can be spot/theta-created model moves. Receipt ordering is not causality.'
+    report['impulse_audit']=[r for rows in impulses.values() for r in rows][:128]
+    report['_trade_openings']=sorted(trade_openings,key=lambda r:(r['timestamp_wall'],r['raw_id']))
+    report['seconds']=data['data_read_seconds']+time.monotonic()-started
     return report
 
 
 def text_report(report):
-    lines=['BASIS / EXPLORATORY GAP RESPONSE',f"{report['frame_records_read']:,} frame records, {len(report['windows'])} chronology windows. N = event/day blocks.",
+    lines=['BASIS / EXPLORATORY GAP SHAPE',f"{report['frame_records_read']:,} frames; {report['opening_count']:,} openings; {report['unique_events']} events; {report['event_day_blocks']} event/day blocks.",
         'HORIZON    N    OPT toward PM   PM toward OPT    OPT move pp   GAP close pp']
     for h,r in report['horizons'].items():
         if r.get('n_blocks'):lines.append(f"{h+'s':>7} {r['n_blocks']:5d} {100*r['opt_toward_rate']:14.1f}% {100*r['pm_toward_rate']:14.1f}% {r['mean_opt_move_pp']:14.4f} {r['mean_convergence_pp']:14.4f}")
     lines+=['GAP @30m    N     OPT toward PM   AVG close pp']
-    for k,r in report['edge_surface']['gap_pp'].items():lines.append(f"{k:<10} {r['n_blocks']:5d} {100*r['opt_toward_rate']:14.1f}% {r['mean_convergence_pp']:14.4f}")
-    lines.append('Half-life: '+str(report['lifecycle']))
-    lines.append('Beta / Poly reversion b (opening controls; then ex-post spot controls):')
-    for h in report['horizons']:
-        a=report['regressions'][h];b=report['spot_conditioned'][h]
-        lines.append(f"{h}s: beta {a.get('options_beta',{}).get('coefficient')} / b {a.get('poly_reversion_b',{}).get('coefficient')}; spot beta {b.get('options_beta',{}).get('coefficient')}")
+    for k,r in sorted(report['edge_surface']['gap_pp'].items()):lines.append(f"{k:<10} {r['n_blocks']:5d} {100*r['opt_toward_rate']:14.1f}% {r['mean_convergence_pp']:14.4f}")
+    for kind,r in report['gap_provenance']['1800'].items():
+        if r.get('n_blocks'):lines.append(f"{kind}: N {r['n_blocks']}, OPT {100*r['opt_toward_rate']:.1f}%, mean move {r['mean_opt_move_pp']:.4f}pp")
+    if report.get('trade_math'):
+        lines.append('STRUCTURE HORIZON N WIN% MEAN PNL MEDIAN PNL COSTS')
+        for h,r in report['trade_math']['horizons'].items():lines.append(f"{h} {r['n_blocks']} {r['win_rate']*100:.1f}% ${r['mean_pnl']:.2f} ${r['median_pnl']:.2f} ${r['total_cost']:.2f}")
     return '\n'.join(lines)

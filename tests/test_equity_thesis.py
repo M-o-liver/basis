@@ -6,7 +6,7 @@ import pandas as pd
 from basislab.collector import price_event_slugs
 from basislab.config import Config
 from basislab.engine import Engine
-from basislab.equities import calendar, session_close, snapshot
+from basislab.equities import calendar, session_close, snapshot, option_contract
 from basislab.pricing import derive
 from basislab.semantics import infer_event, timestamp
 from basislab.store import Store
@@ -22,6 +22,14 @@ def stock():
 
 
 class EquityThesisTests(unittest.TestCase):
+    def test_zero_book_does_not_turn_placeholder_iv_into_research_probability(self):
+        row=dict(contractSymbol='AAPL261106C00340000',strike=340,bid=0,ask=0,lastPrice=11.05,impliedVolatility=.01563484375)
+        missing=option_contract(row,'call')
+        self.assertIsNone(missing['iv']);self.assertEqual(missing['provider_iv'],row['impliedVolatility'])
+        self.assertEqual(missing['quote_state'],'MISSING_BID_ASK');self.assertEqual((missing['bid'],missing['ask']),(0,0))
+        quoted=option_contract(dict(row,bid=11.0,ask=11.3,impliedVolatility=.30),'call')
+        self.assertEqual(quoted['iv'],.30);self.assertEqual(quoted['quote_state'],'QUOTED')
+
     def test_low_and_new_york_month_boundary(self):
         e=infer_event(stock())
         self.assertEqual(e['direction'],'down');self.assertEqual(e['event_type'],'touch')
