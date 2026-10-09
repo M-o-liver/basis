@@ -1,4 +1,4 @@
-"""Seven targeted math and funded-structure regressions, no new framework."""
+"""Targeted gap and actual-payoff regressions, no new framework."""
 import copy
 import math
 from pathlib import Path
@@ -6,10 +6,9 @@ import tempfile
 import time
 import unittest
 import numpy as np
-from basislab.gap_math import binary_ev,conditional_ev,conditional_paths,gap_math,horizon_outcome,payoff,vertical
+from basislab.gap_math import conditional_ev,conditional_paths,gap_math,horizon_outcome,payoff,vertical
 from basislab.market_math import MarketMath
 from basislab.pricing import normal_cdf
-from basislab.sim import Sim
 from basislab.store import Store
 from basislab.engine import Engine
 
@@ -35,7 +34,6 @@ class GapMathTests(unittest.TestCase):
         self.assertAlmostEqual(t['debit'],101.9045)
         self.assertEqual(t['max_payout'],500)
         self.assertAlmostEqual(t['q_exec'],.203809)
-        self.assertAlmostEqual(binary_ev(.3,t)['ev'],48.0955)
 
     def test_terminal_put_vertical_buy_high_sell_low(self):
         t=vertical(contract(100,1,1.1,'put'),contract(105,1.9,2,'put'),'put',100)
@@ -83,26 +81,31 @@ class GapMathTests(unittest.TestCase):
         self.assertAlmostEqual(result['poly_reversion_b']['coefficient'],.1)
         self.assertIn('IV',result['constant_controls_dropped'])
 
-    def test_funded_atomic_structure_pending_fill_reject_restore(self):
-        now=time.time_ns()//1000000
-        store=Store(':memory:');engine=Engine(store)
-        legs=[contract(100,1.9,2),contract(105,1,1.1)]
-        for c in legs:c.update(source_ms=now,quote_quality='DERIBIT_PUBLIC_SNAPSHOT_USD_CONVERSION')
-        surface=dict(venue='deribit',expiry=now+86400000,calls=legs,puts=[],received_ms=now,source_ms=now,raw_id=1)
-        engine.surfaces[('BTC',surface['expiry'])]=surface
-        engine.spots['BTC']=dict(price=100,source_ms=now,received_ms=now)
-        engine.events['a']=dict(mapping_hash=None,expiry=surface['expiry'])
-        math_engine=MarketMath(engine);trade=dict(vertical(*legs,'call',1),asset='BTC',event_id='a',expiry=surface['expiry'],math_calculated_ms=now,quote_received_ms=now)
-        math_engine.tickets['exact']=trade
-        with tempfile.TemporaryDirectory() as d:
-            sim=Sim(math_engine,Path(d)/'sim.sqlite3')
-            order=sim.submit(dict(structure_id='exact',quantity=1))
-            self.assertEqual(order['status'],'PENDING');sim.process(order['fill_due_ms']-1)
-            self.assertEqual(sim.order(order['order_id'])['status'],'PENDING')
-            sim.process(order['fill_due_ms']);fill=sim.order(order['order_id'])
-            self.assertEqual(fill['status'],'FILLED');self.assertAlmostEqual(sim.cash,100000-fill['debit'])
-            order=sim.submit(dict(structure_id='exact',quantity=1));surface['received_ms']=now-45001
-            sim.process(order['fill_due_ms']);self.assertIn('QUOTE_STALE',sim.order(order['order_id'])['reason'])
-            balance=sim.cash;sim.close();sim=Sim(math_engine,Path(d)/'sim.sqlite3')
-            self.assertEqual(sim.cash,balance);self.assertEqual(len(sim.positions),1);sim.close()
-        store.close()
+    def test_terminal_conditional_neutral_and_actual_ramp(self):
+        paths=conditional_paths(100,100,.4,.1,.1,'up','terminal',paths=65536)
+        t=vertical(contract(95,5.5,5.6),contract(105,.8,.9),'call',1)
+        q=paths['q_model'];neutral=conditional_ev(q,t,paths)
+        self.assertAlmostEqual(neutral['information_value'],0)
+        self.assertAlmostEqual(neutral['expected_payoff'],q*neutral['payoff_if_hit']+(1-q)*neutral['payoff_if_no_hit'])
+        r=conditional_ev(.11,t,paths)
+        self.assertGreater(abs(r['expected_payoff']-.11*t['max_payout']),.5)
+        self.assertAlmostEqual(r['information_value'],(.11-q)*(r['payoff_if_hit']-r['payoff_if_no_hit']))
+        self.assertAlmostEqual(r['net_ev'],r['ev']-r['estimated_exit_drag'])
+
+    def test_gap_provenance_is_prior_only(self):
+        from basislab.gap_math import formation
+        a=dict(event_id='a',mapping_hash='x',timestamp_wall=30000,raw_id=8,pm_yes=.6,opt_yes=.4,spot=100)
+        before=dict(a,timestamp_wall=0,raw_id=1,pm_yes=.5)
+        r=formation(a,before);self.assertEqual(r['provenance'],'PM_CREATED');self.assertTrue(r['fresh_pm_unfollowed'])
+        self.assertEqual(formation(a,dict(before,timestamp_wall=1))['reason'],'INSUFFICIENT_CAUSAL_LOOKBACK')
+        self.assertEqual(formation(a,dict(before,mapping_hash='future'))['reason'],'INSUFFICIENT_CAUSAL_LOOKBACK')
+
+    def test_nonlinear_curve_and_right_censoring(self):
+        from basislab.gap_shape import response_curve,hazard_summary
+        rows=[dict(block=str(i),event_id=str(i),gap_pp=.5,opt_toward=.2) for i in range(20)]
+        rows += [dict(block=str(i+20),event_id=str(i+20),gap_pp=6,opt_toward=1.8) for i in range(20)]
+        curve={p['x']:p for p in response_curve(rows)}
+        self.assertAlmostEqual(curve[.5]['mean_pp'],.2);self.assertAlmostEqual(curve[6]['mean_pp'],1.8)
+        r=dict(block='a',event_id='a',censor_s=15,censor_reason='MISSING',close25_s=None,half_s=None,full_s=None,double_s=None,time_to_max_s=0)
+        self.assertIsNone(hazard_summary([r])['horizons']['7200']['p_50_closed'])
+        self.assertEqual(hazard_summary([dict(r,censor_s=7200)])['horizons']['7200']['p_50_closed'],0)

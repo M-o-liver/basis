@@ -4,7 +4,7 @@ A dense, monochrome market table for one question: when Polymarket probability P
 
 **Polymarket is the reference signal.** Conventional-market exposure is cheap when P > Q and rich when P < Q. Options probabilities are risk-neutral/model estimates, not necessarily physical beliefs.
 
-The browser contains only **Markets** and one selected-event math pane. It shows actual calls/puts, GAP, relative gap, log-odds/odds ratio, concrete defined-risk legs, costs, conditional PM-based EV, historical event/day sample counts and one small PM/OPT/gap chart. No analyzer screens, general tickets, automatic policies or wallet competition.
+The browser contains only **Markets**, one selected-event math pane and a compact **Starred** section. It shows actual calls/puts, gap formation, log-odds/odds ratio, exact defined-risk structures, conditional payoffs, PM information value versus execution drag and historical event/day sample counts.
 
 ## Run
 
@@ -14,30 +14,34 @@ python3 -m venv .venv
 ./basis serve
 ```
 
-Open http://127.0.0.1:8765. Filter with `/`, select with j/k or click, close details with Esc, refresh with R. Default order is currently executable positive modeled EV. Yahoo remains delayed/unknown-delay research data; closed stock markets block paper entry.
+Open http://127.0.0.1:8765. Filter with `/`, select with j/k or click, close details with Esc, refresh with R and star with S or ☆. Default ordering is prior PM-created gap strength, then information/drag; raw gap and other sorts remain available. Yahoo remains delayed/unknown-delay research data.
 
-BASIS SIM starts once with $100,000 in `data/basis.sim.sqlite3`. The operator buys complete displayed structures, at actual ask/bid plus explicit fees/slippage/impact and one-second latency. No real orders. Historical wallets and the prospective sidecar are preserved, excluded from the live product.
+A star freezes the displayed signal and exact contracts in `data/basis.stars.sqlite3`. Entry waits for the first complete valid options receipt after STAR+5s, or next XNYS open+10s for a closed stock market. It records actual receipt delay and STAR versus ENTRY gaps. Exact contracts cannot be replaced. Quotes that remain unavailable for ten minutes after the target produce MISSED with a reason.
+
+Each star is an independent observation, with no account balance or capital limits. Entry crosses ask/bid with explicit existing costs; liquidation crosses bid/ask with exit costs. Select a star for its executable RETURN % / 1× P&L graph and STOP to retain its final mark. Closed equities retain a labeled last mark. Expiry uses a causal recorded-spot payoff proxy only when available, otherwise SETTLEMENT MISSING. Historical SIM, wallet and prospective databases remain preserved and outside the live product.
 
 ## The math
 
 GAP pp = 100(P-Q). REL = abs(P-Q)/Q. LOG ODDS GAP = logit(P)-logit(Q). ODDS× = exp(LOG ODDS GAP). Exact endpoints use half the assumed .001 quote resolution; interior tail values remain raw.
 
-Same-expiry terminal events use call/put debit verticals bracketing the threshold. Q_EXEC is debit / maximum payout. Binary-equivalent EV is P(exposure) × max payout − debit; this is an approximation to the vertical ramp, and binary-equivalent Kelly is not actual multi-leg Kelly sizing. Negative gaps select opposite event exposure.
+Terminal and touch events use actual long call/put or vertical payoffs. H is evaluated at event cutoff and X at option expiry, including when expiry is later. Expected PM payoff = P E_Q[X|H] + (1−P) E_Q[X|not H]. A vertical's ramp is evaluated directly; debit / maximum payout remains descriptive, not its EV model.
 
-Touch and later-expiry events use actual option payoffs under the existing flat-IV/zero-carry GBM, with continuous barriers and importance sampling. PM changes the event mixing weight: P* = P Q(.|H) + (1-P) Q(.|not H). Conditional means are cached; EV(P) is a linear substitution. Q-only price, PM increment, numerical uncertainty and calibration against the quote band are visible. Positive model residual alone is not a PM edge.
+Conditional paths use the existing flat-IV/zero-carry GBM, continuous barriers and importance sampling. Conditional means are cached; PM-only updates are a linear substitution. Event mass uses the displayed recorded Q while conditional shape remains the model's. PM information value = (P−Q)(E_Q[X|H]−E_Q[X|not H]). Nearby strikes/widths are ranked by positive net information/EV, then information/drag. Q-only price must fit the quote band within numerical uncertainty. Entry drag, estimated exit drag and expiry EV remain separate; a favorable model-pricing residual alone is not a PM edge.
 
-US equities use multiplier 100. Deribit inverse premiums are converted from their native coin units at observed spot, with multiplier 1; the paper account is a USD cash-payoff proxy. [Deribit contract/settlement conventions](https://support.deribit.com/hc/en-us/articles/29734325712413-Settlement) differ from brokerage-quality USD fills. Yahoo American options, zero dividends, overnight paths and later expiry are explicit proxies. probability-1.3.0 extends the equity IV-tenor mapping to seven days after cutoff; crypto remains at 72 hours.
+US equities use multiplier 100. Deribit inverse premiums are converted from their native coin units at observed spot, with multiplier 1; tracked results are a USD payoff proxy. Native exchange settlement differs from this representation. Yahoo American options, zero dividends, overnight paths and later expiry remain explicit proxies. The underlying probability-1.3.0 reducer is unchanged.
 
 ## Historical research
 
 ```sh
 ./basis gaps
-./basis gaps --json --per-day 2 --output data/gap-response.json
+./basis gaps --json --per-day 2 --output data/gap-shape.json
 ./basis gaps --from 2026-10-01T00:00:00Z --to 2026-10-08T00:00:00Z
 ./basis math <event_id>
 ```
 
-`gaps` reads the tape, including small continuous discrepancies, using bounded deterministic chronology windows. The JSON includes seven horizons, error-correction regressions, spot attribution, class/regime strata, native jump studies, gap/odds bins, censored half-lives and quote-based historical trade math. N means event/day blocks, not frames. It writes a derived exploratory report, never rewrites the source tape. The [initial numerical results and limitations](docs/gap-response-2026-10-08.md) show no established global OPT-following edge and negative sampled trade returns after costs. Increase `--per-day` deliberately for wider coverage; the default is not a full dataset replay.
+`gaps` reads all usable gap magnitudes in bounded deterministic chronology windows. The JSON includes eight horizons through 2h, nonlinear gap/log-odds response curves, block uncertainty, prior-only formation, prediction-time versus ex-post spot controls, native impulse studies and right-censored closure/doubling hazards. Historical exact structures are evaluated at fixed 30m/2h/session-close/next-open/recorded-expiry horizons with ordinary entry latency. N means event/day blocks, not frames.
+
+The [new numerical report](docs/gap-shape-2026-10-08.md) finds stronger descriptive response at larger gaps, uncertain incremental fresh-PM information after controls, and negative overall executable structure returns. Sparse favorable strata remain exploratory. `data/gap-shape.json` supplies comparable history to market details; `--per-day` deliberately increases coverage. Derived reports never rewrite the source tape. The [earlier report](docs/gap-response-2026-10-08.md) remains dated evidence.
 
 ## Recorder / recovery
 
