@@ -18,6 +18,8 @@ from .store import Store, encode
 from .tape import open_store
 from .market_math import MarketMath
 from .tracking import Tracker
+from .experiment import Experiment
+from .quote_audit import audit as quote_audit
 from .operations import Journal, RecorderMonitor
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -54,6 +56,7 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
     math_engine.start()
     tracker = Tracker(math_engine, Path(db).with_suffix('.stars.sqlite3'))
     tracker.start()
+    experiment = Experiment(Path(db).with_suffix('.experiment.sqlite3'))
 
     history_path=Path(db).parent/'gap-shape.json'
     history_cache={'mtime':None,'data':{}}
@@ -108,7 +111,17 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                     event_id = q.get('event_id',[''])[0]
                     with math_engine.lock:row = math_engine.rows.get(event_id)
                     if row is None:raise ValueError('Explicit event_id is unavailable; select a current market')
-                    self.send(200, dict(row=dict(row,history=historical_match(row))))
+                    detail=dict(row,history=historical_match(row))
+                    chain=row.get('chain',[])
+                    if chain and row.get('opt_yes') is not None and chain[0].get('venue')=='yahoo':
+                        surface=dict(venue='yahoo',expiry=row['option_expiry'],raw_id=row['surface_raw_id'],
+                                     received_ms=chain[0]['received_ms'],
+                                     calls=[c for c in chain if c['option_type']=='call'],
+                                     puts=[c for c in chain if c['option_type']=='put'])
+                        detail['quote_audit']=quote_audit(row,surface,row['calculated_at'])
+                    self.send(200, dict(row=detail))
+                elif path.path == '/api/experiment':
+                    self.send(200,experiment.snapshot())
                 elif path.path == '/api/gap-history':
                     event_id=q.get('event_id',[''])[0];minutes=int(q.get('minutes',[30])[0])
                     if not event_id or minutes not in (5,30,120):raise ValueError('Require event_id and 5, 30 or 120 minutes')
@@ -206,4 +219,4 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
         httpd.server_close(); tracker.close(); math_engine.close(); collector.close()
         monitor.checkpoint()
         journal.record('service_stopped', session=engine.session, raw_id=engine.last_raw_id, reason=reason)
-        store.close(); journal.close(); lock.close()
+        experiment.close(); store.close(); journal.close(); lock.close()

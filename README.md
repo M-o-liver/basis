@@ -4,7 +4,7 @@ A dense, monochrome market table for one question: when Polymarket probability P
 
 **Polymarket is the reference signal.** Conventional-market exposure is cheap when P > Q and rich when P < Q. Options probabilities are risk-neutral/model estimates, not necessarily physical beliefs.
 
-The browser contains only **Markets**, one selected-event math pane and a compact **Starred** section. It shows actual calls/puts, gap formation, log-odds/odds ratio, exact defined-risk structures, conditional payoffs, PM information value versus execution drag and historical event/day sample counts.
+The browser contains **Markets**, one selected-event math pane, a compact **Starred** section and the **paperMoney experiment journal**. It shows actual calls/puts, gap formation, log-odds/odds ratio, exact defined-risk structures, conditional payoffs, PM information value versus execution drag and historical event/day sample counts.
 
 ## Run
 
@@ -33,6 +33,10 @@ Conditional paths use the existing flat-IV/zero-carry GBM, continuous barriers a
 US equities use multiplier 100. Deribit inverse premiums are converted from their native coin units at observed spot, with multiplier 1; tracked results are a USD payoff proxy. Native exchange settlement differs from this representation. Yahoo American options, zero dividends, overnight paths and later expiry remain explicit proxies. The underlying probability-1.3.0 reducer is unchanged.
 
 ## Historical research
+
+Selected equity details expose the captured resolution wording and `quote-audit-1.0`: OTM bid/mid/ask IV inversion plus a regular-session touch sensitivity check. It never rewrites the recorded Q or silently replaces the probability reducer. Nights evolve prices but cannot resolve a regular-session barrier. Its numerical error is not model or trading confidence.
+
+The [RSI protocol](docs/rsi-protocol.md) separates actual GUI paperMoney fills from stars and exploratory tests. `./basis journal` verifies and reads the append-only local journal in `data/basis.experiment.sqlite3`. `./basis journal --record evidence.json` appends one envelope (`kind`, `data`, `observed_ms`), and `--full --output data/rsi-summary.json` exports a derived summary with every original record. Account baselines survive restart; partial closes use FIFO; unknown costs stay null; later confirmed fees append linked evidence. The journal cannot place orders. Account/fill artifacts remain Git-ignored.
 
 ```sh
 ./basis gaps

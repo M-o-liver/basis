@@ -81,7 +81,26 @@ def main():
     gaps.add_argument('--output',default='data/gap-shape.json');gaps.add_argument('--no-trade-math',action='store_true')
     gaps.add_argument('--from',dest='gap_start');gaps.add_argument('--to',dest='gap_end')
     math_command=commands.add_parser('math');math_command.add_argument('event_id')
+    experiment_command=commands.add_parser('journal',help='GUI paperMoney evidence and account record; never orders')
+    experiment_command.add_argument('--record',help='Append one local JSON evidence envelope: kind, data, observed_ms')
+    experiment_command.add_argument('--output',help='Export a derived JSON summary; original evidence remains immutable')
+    experiment_command.add_argument('--full',action='store_true',help='Include every original record in the derived export')
     args = parser.parse_args()
+    if args.command=='journal':
+        from pathlib import Path
+        from .experiment import Experiment
+        from .tape import atomic_json
+        journal=Experiment(Path(args.db).with_suffix('.experiment.sqlite3'))
+        try:
+            if args.record:
+                record=json.loads(Path(args.record).read_text())
+                journal.append(record['kind'],record['data'],record.get('observed_ms'))
+            result=journal.snapshot()
+            if args.full:result['records']=journal.records()
+            if args.output:atomic_json(args.output,result)
+            print(json.dumps(result,indent=2))
+        finally:journal.close()
+        return
     if args.command=='storage-shadow':
         from .storage_shadow import run_shadow
         result=run_shadow(args.db,args.output,args.minutes);print(json.dumps(result,indent=2))
