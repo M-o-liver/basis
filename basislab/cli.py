@@ -87,11 +87,26 @@ def main():
     payoff_command.add_argument('--book',help='Optional normalized paperMoney GUI quote JSON; exact captured contracts only')
     payoff_command.add_argument('--max-loss',type=float,help='Explicit research risk cap; the UI uses the recorded baseline and protocol')
     payoff_command.add_argument('--output',help='Save a derived report; never edits source evidence')
+    kelly_command=commands.add_parser('kelly-audit',help='Model-dependent expiry half Kelly from captured evidence; never orders')
+    kelly_command.add_argument('snapshot')
+    kelly_command.add_argument('--book',required=True)
+    kelly_command.add_argument('--instrument',required=True)
+    kelly_command.add_argument('--entry-price',type=float,required=True)
+    kelly_command.add_argument('--equity',type=float,required=True)
+    kelly_command.add_argument('--output')
     experiment_command=commands.add_parser('journal',help='GUI paperMoney evidence and account record; never orders')
     experiment_command.add_argument('--record',help='Append one local JSON evidence envelope: kind, data, observed_ms')
     experiment_command.add_argument('--output',help='Export a derived JSON summary; original evidence remains immutable')
     experiment_command.add_argument('--full',action='store_true',help='Include every original record in the derived export')
     args = parser.parse_args()
+    if args.command=='kelly-audit':
+        from pathlib import Path
+        from .kelly_audit import sizing
+        from .tape import atomic_json
+        captured=json.loads(Path(args.snapshot).read_text())
+        result=sizing(captured.get('row',captured),json.loads(Path(args.book).read_text()),args.instrument,args.entry_price,args.equity)
+        if args.output:atomic_json(args.output,result)
+        print(json.dumps(result,indent=2));return
     if args.command=='payoff-audit':
         from pathlib import Path
         from .payoff_audit import from_snapshot
