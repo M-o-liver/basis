@@ -89,3 +89,22 @@ class ExperimentTests(unittest.TestCase):
                 paper_money_visible=False, evidence='Unverified'), 2000)
         with self.assertRaises(ValueError):
             self.journal.append('RESEARCH', dict(finding='Future', evidence='Invalid'), 2**63-1)
+
+    def test_unexposed_ids_keep_local_identity_and_actual_costs_separate(self):
+        self.plan()
+        def unknown(local, action, price, fee):
+            return dict(trade_id='test', broker_fill_id=None, broker_id_status='NOT_EXPOSED_IN_GUI',
+                        local_fill_ref=local, action=action, quantity=1, unit_cash=price,
+                        fees=fee, contracts=['EXACT'], evidence='GUI filled row and statement')
+        opening = unknown('open-proof', 'OPEN', 100, None)
+        self.journal.append('FILL', opening, 1200)
+        with self.assertRaises(ValueError):
+            self.journal.append('FILL', opening, 1300)
+        self.journal.append('FILL', unknown('close-proof', 'CLOSE', 120, 3), 1400)
+        self.journal.append('COST', dict(broker_fill_id=None, broker_id_status='NOT_EXPOSED_IN_GUI',
+                            local_fill_ref='open-proof', fees=2, evidence='Later statement'), 1500)
+        self.assertEqual(self.journal.snapshot()['realized_net'], 15)
+        self.assertEqual(self.journal.snapshot()['actual_fees'], 5)
+        self.assertIsNone(self.journal.records()[2]['data']['broker_fill_id'])
+        with self.assertRaises(ValueError):
+            self.journal.append('FILL', dict(opening, local_fill_ref='other', broker_id_status='UNKNOWN'), 1600)

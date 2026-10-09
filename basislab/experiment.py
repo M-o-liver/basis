@@ -13,7 +13,23 @@ import time
 from .semantics import number
 from .store import encode
 
-VERSION = 'experiment-journal-1.0'
+VERSION = 'experiment-journal-1.1'
+
+
+def execution_identity(data, kind='FILL'):
+    """Never invent an external ID when a GUI only exposes execution evidence."""
+    field = 'broker_fill_id' if kind == 'FILL' else 'broker_order_id'
+    if field not in data:
+        raise ValueError('Report broker identifier or explicitly mark it unknown')
+    value = data[field]
+    if value is not None:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError('Invalid broker identifier')
+        return ('broker', value)
+    local = data.get('local_fill_ref' if kind == 'FILL' else 'local_order_ref')
+    if data.get('broker_id_status') != 'NOT_EXPOSED_IN_GUI' or not isinstance(local, str) or not local.strip():
+        raise ValueError('Unknown broker ID needs explicit status and a local evidence reference')
+    return ('local', local)
 KINDS = ('MANDATE', 'ACCOUNT', 'RESEARCH', 'REVISION', 'PLAN', 'ORDER', 'FILL', 'COST', 'MARK', 'OUTCOME')
 
 
@@ -82,9 +98,9 @@ class Experiment:
         elif kind in ('RESEARCH', 'OUTCOME'):
             required(data, 'finding')
         elif kind == 'COST':
-            required(data, 'broker_fill_id')
+            identity = execution_identity(data)
             numeric(data, 'fees', 0)
-            if not any(r['kind']=='FILL' and r['data']['broker_fill_id']==data['broker_fill_id'] for r in rows):
+            if not any(r['kind']=='FILL' and execution_identity(r['data'])==identity for r in rows):
                 raise ValueError('Actual cost must refer to a recorded broker fill')
         elif kind == 'PLAN':
             required(data, 'trade_id', 'signal', 'legs', 'hypothesis', 'entry_criteria',
@@ -106,12 +122,14 @@ class Experiment:
             if not plans:
                 raise ValueError('Freeze a BASIS-derived plan before recording execution')
             if kind == 'ORDER':
-                required(data, 'broker_order_id', 'status')
+                execution_identity(data, 'ORDER')
+                required(data, 'status')
             elif kind == 'MARK':
                 numeric(data, 'unit_credit')
                 required(data, 'quote_status')
             else:
-                required(data, 'broker_fill_id', 'action', 'contracts')
+                identity = execution_identity(data)
+                required(data, 'action', 'contracts')
                 if 'fees' not in data:
                     raise ValueError('Report actual fees or explicitly mark them unknown with null')
                 if data['action'] not in ('OPEN', 'CLOSE'):
@@ -124,7 +142,7 @@ class Experiment:
                     numeric(data, 'fees', 0)
                 if sorted(data['contracts']) != sorted(l['instrument'] for l in plans[0]['legs']):
                     raise ValueError('Fill must use the frozen exact contracts')
-                if any(r['kind'] == 'FILL' and r['data']['broker_fill_id'] == data['broker_fill_id'] for r in rows):
+                if any(r['kind'] == 'FILL' and execution_identity(r['data']) == identity for r in rows):
                     raise ValueError('Broker fill already recorded')
                 fills = [r['data'] for r in rows if r['kind'] == 'FILL' and r['data']['trade_id'] == data['trade_id']]
                 position = sum(f['quantity'] * (1 if f['action'] == 'OPEN' else -1) for f in fills)
@@ -174,13 +192,13 @@ class Experiment:
             peak = max(peak, account['equity'])
             drawdown = max(drawdown, peak - account['equity'])
         plans = {r['data']['trade_id']: r['data'] for r in rows if r['kind'] == 'PLAN'}
-        costs_by_fill = {r['data']['broker_fill_id']:r['data']['fees'] for r in rows if r['kind']=='COST'}
+        costs_by_fill = {execution_identity(r['data']):r['data']['fees'] for r in rows if r['kind']=='COST'}
         trades = []
         for identity, plan in plans.items():
             fills = [r['data'] for r in rows if r['kind'] == 'FILL' and r['data']['trade_id'] == identity]
             lots, gross, net, costs = [], 0, 0, 0
             for fill in fills:
-                quantity, fee = fill['quantity'], costs_by_fill.get(fill['broker_fill_id'],fill['fees'])
+                quantity, fee = fill['quantity'], costs_by_fill.get(execution_identity(fill),fill['fees'])
                 costs = costs + fee if costs is not None and fee is not None else None
                 if fill['action'] == 'OPEN':
                     lots.append(dict(quantity=quantity, price=fill['unit_cash'], fee=None if fee is None else fee / quantity))
