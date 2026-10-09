@@ -60,8 +60,9 @@ class TrackingTests(unittest.TestCase):
         self.setup_market('AAPL',now,expiry);star=self.tracker.create('a','shown',now);key=star['tracking_id'];opened=next_open(now)
         self.assertEqual(star['target_entry'],opened+10000)
         self.consume_quote(opened+9999);self.assertEqual(self.tracker.stars[key]['status'],'WAITING')
-        self.consume_quote(opened+54000);self.assertEqual(self.tracker.stars[key]['entry']['actual_entry_receipt'],opened+54000)
-        self.assertEqual(self.tracker.stars[key]['entry']['entry_delay_after_target_ms'],44000)
+        self.consume_quote(opened+720000,missing=True);self.assertEqual(self.tracker.stars[key]['status'],'WAITING')
+        self.consume_quote(opened+1014000);self.assertEqual(self.tracker.stars[key]['entry']['actual_entry_receipt'],opened+1014000)
+        self.assertEqual(self.tracker.stars[key]['entry']['entry_delay_after_target_ms'],1004000)
     def test_exact_contracts_never_substitute(self):
         star=self.tracker.create('a','shown',self.now);key=star['tracking_id'];symbols=[l['instrument'] for l in self.tracker.stars[key]['frozen']['structure']['legs']]
         self.consume_quote(self.now+6000,missing=True)
@@ -84,3 +85,48 @@ class TrackingTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):self.tracker.db.execute('DELETE FROM stars')
         ended=self.tracker.finish(a['tracking_id'],self.now+9000);self.assertEqual(ended['status'],'ENDED')
         self.assertEqual(encode(self.tracker.stars[a['tracking_id']]['frozen']),before)
+
+    def test_unavailable_structure_does_not_create_a_dead_star(self):
+        self.math.displayed['shown'].update(trade=None,trade_reason='MISSING_ACTUAL_BID_ASK')
+        with self.assertRaisesRegex(ValueError,'MISSING_ACTUAL_BID_ASK'):self.tracker.create('a','shown',self.now)
+        self.assertEqual(self.tracker.snapshot()['rows'],[])
+        self.assertEqual(self.tracker.db.execute('SELECT COUNT(*) FROM stars').fetchone()[0],0)
+
+    def test_new_asset_recovers_its_prior_path_before_first_entry(self):
+        self.tracker.create('a','shown',self.now);self.consume_quote(self.now+7000)
+        start=(self.now//86400000-1)*86400000
+        event=dict(self.engine.events['a'],event_id='b',asset='ETH',yes_token='ethyes',mapping_hash='eth-map',event_type='touch',strike_or_threshold=105,window_start=start)
+        self.engine.manual['b']=event;self.engine.events['b']=event
+        payload=self.options(self.now+8000)
+        for c in payload['result']:c['instrument_name']=c['instrument_name'].replace('BTC-','ETH-')
+        self.engine.ingest('coinbase','spot','ETH',dict(price=100,timestamp=self.now+8000),received_ms=self.now+8000)
+        self.engine.ingest('deribit','options','ETH',payload,received_ms=self.now+8000,source_ms=self.now+8000)
+        self.engine.ingest('clob','pm','tokens',dict(event_type='book',asset_id='ethyes',timestamp=self.now+9000,bids=[dict(price=.94,size=1)],asks=[dict(price=.96,size=1)]),received_ms=self.now+9000)
+        history_id=self.engine.ingest('coinbase','history','ETH',dict(start_ms=start,candles=[[start//1000,90,101,100,100,1]]),received_ms=self.now+9000)
+        self.tracker.process();self.assertNotIn(('ETH',start),self.tracker.reducer.histories)
+        trade=dict(self.math.displayed['shown']['trade'],asset='ETH',event_id='b',event_version='eth-map')
+        trade['legs']=[dict(l,instrument=l['instrument'].replace('BTC-','ETH-')) for l in trade['legs']]
+        self.math.displayed['eth']=dict(self.engine.latest['b'],trade=trade,event_semantics=event,calculated_at=self.now+10000,math=gap_math(.95,self.engine.latest['b']['opt_yes']))
+        star=self.tracker.create('b','eth',self.now+10000);self.tracker.process()
+        self.assertEqual(self.tracker.reducer.histories[('ETH',start)]['raw_id'],history_id)
+        for c in payload['result']:c['creation_timestamp']=self.now+16000
+        self.engine.ingest('deribit','options','ETH',payload,received_ms=self.now+16000,source_ms=self.now+16000);self.tracker.process()
+        entry=self.tracker.stars[star['tracking_id']]['entry']
+        self.assertIsNotNone(entry['q_entry']);self.assertIsNotNone(entry['gap_entry_pp'])
+        self.assertEqual(entry['input_refs']['history'],history_id)
+
+    def test_remove_hides_failed_and_live_stars_preserving_history_after_restart(self):
+        a=self.tracker.create('a','shown',self.now);self.consume_quote(self.now+7000)
+        b=self.tracker.create('a','shown',self.now+8000)
+        self.tracker.append(b['tracking_id'],'MISSED',dict(timestamp_ms=self.now+9000,reason='NO_VALID_POST_TARGET_QUOTE'))
+        originals={key:encode(s['frozen']) for key,s in self.tracker.stars.items()};mark=self.tracker.stars[a['tracking_id']]['mark']
+        self.tracker.remove(b['tracking_id'],self.now+10000);self.tracker.remove(a['tracking_id'],self.now+11000)
+        self.assertEqual(self.tracker.snapshot()['rows'],[])
+        self.assertEqual(self.tracker.snapshot(a['tracking_id'])['summary']['status'],'ENDED')
+        self.assertEqual(self.tracker.snapshot(a['tracking_id'])['mark'],mark)
+        events=self.tracker.db.execute('SELECT COUNT(*) FROM events').fetchone()[0]
+        self.tracker.remove(b['tracking_id'],self.now+12000)
+        self.assertEqual(self.tracker.db.execute('SELECT COUNT(*) FROM events').fetchone()[0],events)
+        path=Path(self.tmp.name)/'stars.sqlite3';self.tracker.close();self.tracker=Tracker(self.math,path)
+        self.assertEqual(self.tracker.snapshot()['rows'],[]);self.assertEqual(self.tracker.snapshot()['removed_count'],2)
+        for key,original in originals.items():self.assertEqual(encode(self.tracker.stars[key]['frozen']),original)

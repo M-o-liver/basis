@@ -18,9 +18,15 @@ from .semantics import infer_event
 from .store import decode,encode
 from .tape import open_store
 
-TRACK_VERSION='star-track-1.0'
+TRACK_VERSION='star-track-1.2'
 ENTRY_WAIT_MS=600000
+STOCK_ENTRY_WAIT_MS=1800000  # Public delayed books may be empty for 15–20min after open.
 ACTIVE=('WAITING','LIVE')
+
+
+def entry_deadline(frozen):
+    # Earlier stars retain their recorded ten-minute policy; no retrospective extension.
+    return min(frozen.get('entry_deadline',frozen['target_entry']+ENTRY_WAIT_MS),frozen['structure']['expiry'])
 
 
 class Tracker:
@@ -53,6 +59,7 @@ class Tracker:
             s.update(status=kind,reason=data['reason'],ended_at=data['timestamp_ms'],end=data)
             if data.get('final') is not None:s['mark']=data['final']
         elif kind=='WAIT_REASON':s['reason']=data['reason']
+        elif kind=='REMOVED':s['removed_at']=data['timestamp_ms']
 
     def append(self,identity,kind,data):
         self.db.execute('INSERT INTO events(tracking_id,kind,timestamp_ms,raw_id,data) VALUES(?,?,?,?,?)',
@@ -65,8 +72,10 @@ class Tracker:
             row=self.math.displayed_snapshot(event_id,snapshot_id)
             if row['timestamp_wall']>now or row['calculated_at']>now:raise ValueError('Displayed snapshot has a future timestamp')
             trade=copy.deepcopy(row.get('trade'));equity=row['asset'] not in ('BTC','ETH')
+            if not trade:raise ValueError('No executable option structure: '+(row.get('trade_reason') or 'NO_DISPLAYED_STRUCTURE'))
             target=now+5000
             if equity and regular_session(now)['market_state']!='OPEN':target=next_open(now)+10000
+            if trade['expiry']<=target:raise ValueError('Displayed option expires before the entry target; refresh this market')
             with self.math.engine.lock:
                 event=row.get('event_semantics') or self.math.engine.events.get(event_id)
                 if not event or event.get('mapping_hash')!=row.get('mapping_hash'):raise ValueError('Displayed event semantics unavailable; refresh this market')
@@ -74,19 +83,23 @@ class Tracker:
             fields=('event_id','event_text','asset','expiry','event_type','direction','strike_or_threshold','mapping_hash','window_start',
                     'settlement_source','threshold_inclusive','timestamp_wall','pm_yes','opt_yes','gap_pp','relative_gap','spot','spot_timestamp',
                     'pm_bid','pm_ask','pm_timestamp','pm_source','opt_timestamp','source_state','quality_flags','model_confidence','basis_method',
-                    'model_inputs','model_version','calculation_version','surface_features','input_refs','raw_id','code_hash','parameter_hash','math','math_version','calculated_at','formation')
+                    'model_inputs','model_version','calculation_version','surface_features','input_refs','raw_id','code_hash','parameter_hash','math','math_version','calculated_at','formation',
+                    'trade_reason','execution_state','quote_age_ms','model_limits')
             snapshot={k:copy.deepcopy(row.get(k)) for k in fields};snapshot['trade']=trade
             frame=None
             for f in reversed(self.math.engine.store.history(event_id,row['timestamp_wall']-2000,row['timestamp_wall'],20,tail=True)):
                 if f['raw_id']<=row['raw_id']:frame=f.get('observation_id',f.get('record_id'));break
-            frozen=dict(tracking_id=uuid.uuid4().hex,starred_at=now,target_entry=target,event_id=event_id,event_semantics=copy.deepcopy(event),
+            wait_ms=STOCK_ENTRY_WAIT_MS if equity else ENTRY_WAIT_MS
+            frozen=dict(tracking_id=uuid.uuid4().hex,starred_at=now,target_entry=target,entry_deadline=min(target+wait_ms,trade['expiry']),event_id=event_id,event_semantics=copy.deepcopy(event),
                 snapshot=snapshot,structure=trade,star_raw_boundary=boundary,opening_frame_id=frame,tracking_version=TRACK_VERSION,
-                math_version=VERSION,calculation_version=row.get('calculation_version'),model_version=row.get('model_version'),initial_status='WAITING' if trade else 'MISSED',
-                entry_policy='First complete valid exact-contract options receipt at/after target; max wait 10min; no wallet/cash rules',
-                reason=None if trade else 'NO_DISPLAYED_STRUCTURE')
-            if trade and trade['expiry']<=target:frozen.update(initial_status='MISSED',reason='OPTION_EXPIRY_BEFORE_TARGET')
+                math_version=VERSION,calculation_version=row.get('calculation_version'),model_version=row.get('model_version'),initial_status='WAITING',
+                entry_policy=f'First complete valid exact-contract options receipt at/after target; max wait {wait_ms//60000}min; no wallet/cash rules',
+                reason=None)
             self.db.execute('INSERT INTO stars VALUES(?,?,?,?)',(frozen['tracking_id'],now,event_id,encode(frozen)))
             self.stars[frozen['tracking_id']]=dict(frozen=frozen,status=frozen['initial_status'],reason=frozen['reason'],entry=None,mark=None)
+            # A newly tracked asset needs its already-recorded context too.
+            # Rehydrate the committed prefix; never borrow today's live state.
+            self.reducer=None
             return self.summary(self.stars[frozen['tracking_id']],now)
 
     def hydrate(self):
@@ -129,6 +142,8 @@ class Tracker:
         if cost['debit']<=0:raise ValueError('NONPOSITIVE_ENTRY_DEBIT')
         info=None;model_reason=None
         try:
+            if row.get('pm_yes') is None or row.get('opt_yes') is None:
+                raise ValueError('Entry probability unavailable: '+row.get('source_state','UNKNOWN')+' / '+', '.join(row.get('quality_flags',[])))
             sigma=row.get('model_inputs',{}).get('iv') or row.get('surface_features',{}).get('local_iv')
             paths=conditional_paths(spot['price'],row['strike_or_threshold'],sigma,(row['expiry']-now)/YEAR_MS,(trade['expiry']-now)/YEAR_MS,row['direction'],row['event_type'])
             if min(paths['hit_effective_paths'],paths['no_hit_effective_paths'])<32:raise ValueError('INSUFFICIENT_CONDITIONAL_PATH_SAMPLE')
@@ -140,7 +155,8 @@ class Tracker:
             log_odds_entry=math['log_odds_gap'],spot_entry=spot['price'],input_refs=row.get('input_refs'),legs=legs,**cost,
             gap_capture_remaining=gap_entry/gap_star if gap_entry is not None and gap_star is not None and abs(gap_star)>=.1 else None,
             pre_entry_repricing_pp=gap_star-gap_entry if gap_star is not None and gap_entry is not None else None,
-            math_version=VERSION,code_hash=e.code_hash,model_inputs=row.get('model_inputs'),modeled_payoff=info,model_reason=model_reason,
+            math_version=VERSION,code_hash=e.code_hash,source_state=row.get('source_state'),quality_flags=row.get('quality_flags'),model_confidence=row.get('model_confidence'),
+            model_inputs=row.get('model_inputs'),modeled_payoff=info,model_reason=model_reason,
             quote_quality=legs[0].get('quote_quality'),option_source_ms=surface.get('source_ms'),event_version=frozen['event_semantics'].get('mapping_hash'))
         self.append(frozen['tracking_id'],'ENTRY',data)
 
@@ -178,10 +194,10 @@ class Tracker:
             f=s['frozen'];t=f['structure']
             if not t or t['asset']!=record['subject'] or now<f['starred_at']:continue
             if s['status']=='WAITING' and now<f['target_entry']:continue
-            if s['status']=='WAITING' and now>f['target_entry']+ENTRY_WAIT_MS:
-                self.append(f['tracking_id'],'MISSED',dict(timestamp_ms=now,raw_id=record['id'],reason='NO_VALID_POST_TARGET_QUOTE: '+(s.get('reason') or 'no complete snapshot')));continue
             if s['status']=='WAITING' and now>=t['expiry']:
                 self.append(f['tracking_id'],'MISSED',dict(timestamp_ms=now,raw_id=record['id'],reason='OPTION_EXPIRED_BEFORE_VALID_ENTRY'));continue
+            if s['status']=='WAITING' and now>entry_deadline(f):
+                self.append(f['tracking_id'],'MISSED',dict(timestamp_ms=now,raw_id=record['id'],reason='NO_VALID_POST_TARGET_QUOTE: '+(s.get('reason') or 'no complete snapshot')));continue
             surface=self.reducer.surfaces.get((t['asset'],t['expiry']));spot=self.reducer.spots.get(t['asset'])
             try:
                 if not surface or surface['raw_id']!=record['id']:raise ValueError('NO_NEW_COMPLETE_SURFACE')
@@ -211,8 +227,9 @@ class Tracker:
                 # Timeouts run only after catching up to the recorded prefix, never ahead of unseen quotes.
                 if not records or self.cursor>=boundary:
                     for s in list(self.stars.values()):
-                        if s['status']=='WAITING' and now>s['frozen']['target_entry']+ENTRY_WAIT_MS:
-                            self.append(s['frozen']['tracking_id'],'MISSED',dict(timestamp_ms=now,reason='NO_VALID_POST_TARGET_QUOTE: '+(s.get('reason') or 'no received options snapshot')))
+                        if s['status']=='WAITING' and now>entry_deadline(s['frozen']):
+                            reason='OPTION_EXPIRED_BEFORE_VALID_ENTRY' if now>=s['frozen']['structure']['expiry'] else 'NO_VALID_POST_TARGET_QUOTE: '+(s.get('reason') or 'no received options snapshot')
+                            self.append(s['frozen']['tracking_id'],'MISSED',dict(timestamp_ms=now,reason=reason))
                         if s['status']=='LIVE' and now>=s['frozen']['structure']['expiry']:self.end_expiry(s,now)
                 self.db.execute('COMMIT')
             except Exception:
@@ -237,15 +254,31 @@ class Tracker:
         if now-m['timestamp_ms']>(120000 if t['multiplier']==100 else 45000):return 'STALE_LAST_MARK'
         return 'VALID_RECEIVED_BOOK_MARK'
 
+    def remove(self,identity,now=None):
+        """Hide from the working list; retain original, final mark and removal evidence."""
+        now=now if now is not None else time.time_ns()//1000000
+        with self.lock:
+            s=self.stars.get(identity)
+            if not s:raise ValueError('No such starred signal')
+            if s.get('removed_at') is not None:return self.summary(s,now)
+            try:
+                self.db.execute('BEGIN IMMEDIATE')
+                if s['status'] in ACTIVE:self.finish(identity,now)
+                self.append(identity,'REMOVED',dict(timestamp_ms=now,reason='OPERATOR_REMOVED_FROM_LIST',tracking_version=TRACK_VERSION))
+                self.db.execute('COMMIT')
+            except Exception:
+                self.db.execute('ROLLBACK');self.reload();self.reducer=None;raise
+            return self.summary(s,now)
+
     def summary(self,s,now=None):
         now=now if now is not None else time.time_ns()//1000000;f=s['frozen'];r=f['snapshot'];e=s['entry'];m=s['mark'];t=f['structure']
         return dict(tracking_id=f['tracking_id'],status=s['status'],reason=s.get('reason'),event_id=f['event_id'],asset=r['asset'],event_text=r['event_text'],
             starred_at=f['starred_at'],star_gap_pp=r['math']['gap_pp'],provenance=(r.get('formation') or {}).get('provenance'),
             structure=t['kind'] if t else None,legs=[dict(instrument=l['instrument'],side=l['side'],strike=l['strike']) for l in t['legs']] if t else [],
-            target_entry=f['target_entry'],actual_entry=e['actual_entry_receipt'] if e else None,entry_gap_pp=e['gap_entry_pp'] if e else None,
+            target_entry=f['target_entry'],entry_deadline=entry_deadline(f) if t else None,actual_entry=e['actual_entry_receipt'] if e else None,entry_gap_pp=e['gap_entry_pp'] if e else None,
             entry_debit=e['debit'] if e else None,liquidation=m['liquidation_credit'] if m else None,pnl_1x=m['pnl_1x'] if m else None,
             return_fraction=m['return_fraction'] if m else None,pnl_per_100=m['pnl_per_100'] if m else None,last_mark=m['timestamp_ms'] if m else None,
-            quote_state=self.quote_state(s,now),ended_at=s.get('ended_at'),age_ms=now-f['starred_at'])
+            quote_state=self.quote_state(s,now),ended_at=s.get('ended_at'),removed_at=s.get('removed_at'),age_ms=now-f['starred_at'])
 
     def snapshot(self,identity=None):
         with self.lock:
@@ -255,7 +288,8 @@ class Tracker:
                 series=[{k:d.get(k) for k in ('timestamp_ms','pnl_1x','return_fraction','raw_id')} for r in self.db.execute("SELECT data FROM events WHERE tracking_id=? AND kind='MARK' ORDER BY id DESC LIMIT 1200",(identity,)) for d in [decode(r[0])]][::-1]
                 return dict(frozen=copy.deepcopy(s['frozen']),entry=copy.deepcopy(s['entry']),mark=copy.deepcopy(s['mark']),end=copy.deepcopy(s.get('end')),
                     summary=self.summary(s),series=series,series_limit=1200,error=self.error)
-            return dict(rows=[self.summary(s) for s in reversed(list(self.stars.values()))],error=self.error,cursor_raw_id=self.cursor)
+            return dict(rows=[self.summary(s) for s in reversed(list(self.stars.values())) if s.get('removed_at') is None],
+                removed_count=sum(s.get('removed_at') is not None for s in self.stars.values()),error=self.error,cursor_raw_id=self.cursor)
 
     def run(self):
         while not self.stop_event.is_set():

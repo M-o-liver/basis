@@ -32,6 +32,17 @@ def regular_session(now):
     return dict(market_state='OPEN' if is_open else 'CLOSED')
 
 
+def option_contract(row,kind):
+    """Do not use provider IV placeholders from a missing/zero quote book."""
+    bid,ask=number(row.get('bid')),number(row.get('ask'));iv=number(row.get('impliedVolatility'))
+    usable=bid is not None and ask is not None and 0<=bid<=ask and ask>0
+    return dict(instrument=str(row['contractSymbol']),strike=number(row['strike']),bid=bid,ask=ask,
+        mark=number(row.get('lastPrice')),iv=iv if usable else None,provider_iv=iv,
+        quote_state='QUOTED' if usable else 'MISSING_BID_ASK',option_type=kind,
+        last_trade=str(row.get('lastTradeDate')),volume=number(row.get('volume')),open_interest=number(row.get('openInterest')),
+        contract_size=str(row.get('contractSize','')),currency=str(row.get('currency','')))
+
+
 def snapshot(asset,cutoffs,starts,offset_hours,now=None):
     import exchange_calendars
     import yfinance as yf
@@ -98,13 +109,13 @@ def snapshot(asset,cutoffs,starts,offset_hours,now=None):
             chain=ticker.option_chain(date)
             def contracts(frame,kind):
                 if frame is None:return []
-                return [dict(instrument=str(r['contractSymbol']),strike=number(r['strike']),bid=number(r['bid']),ask=number(r['ask']),
-                    mark=number(r['lastPrice']),iv=number(r['impliedVolatility']),option_type=kind,
-                    last_trade=str(r['lastTradeDate']),volume=number(r['volume']),open_interest=number(r['openInterest']),
-                    contract_size=str(r.get('contractSize','')),currency=str(r.get('currency',''))) for r in frame.to_dict(orient='records') if number(r.get('strike'))]
-            chains.append(dict(expiry=expiries[date],calls=contracts(chain.calls,'call'),puts=contracts(chain.puts,'put')))
+                return [option_contract(r,kind) for r in frame.to_dict(orient='records') if number(r.get('strike'))]
+            calls,puts=contracts(chain.calls,'call'),contracts(chain.puts,'put')
+            quoted=sum(c['quote_state']=='QUOTED' for c in calls+puts)
+            chains.append(dict(expiry=expiries[date],calls=calls,puts=puts,usable_quotes=quoted))
+            if not quoted:errors.append(dict(stage='quotes',date=date,code='MISSING_BID_ASK',detail='No usable option bid/ask; delayed opening quotes or unavailable provider book. Provider IV retained but excluded from research calculations.'))
         except Exception as error:errors.append(dict(stage='options',date=date,error=type(error).__name__,detail=str(error)[:150]))
-    return dict(chains=chains,available_expiries=dates,spot=spot,spot_source_ms=source_ms,adapter='yfinance',quote_delay='unknown',
+    return dict(chains=chains,available_expiries=dates,spot=spot,spot_source_ms=source_ms,adapter='yfinance',adapter_version='equity-quotes-1.1',quote_delay='unknown',
         histories=histories,partial_errors=errors,expiry_coverage=coverage,underlying_context=dict(asset_class='equity',name=metadata.get('longName') or metadata.get('shortName') or asset,
             exchange=metadata.get('exchangeName'),session_calendar='XNYS',market_state='OPEN' if is_open else 'CLOSED',
             regular_hours_only=True,price_asof=source_ms,session_returns=changes,catalyst=catalyst,

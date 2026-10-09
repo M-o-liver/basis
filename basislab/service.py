@@ -154,6 +154,8 @@ def serve(db='data/basis.sqlite3', port=8765, config=None, collect=True):
                     self.send(200,tracker.create(payload['event_id'],payload['snapshot_id']))
                 elif self.path == '/api/star/stop':
                     self.send(200,tracker.finish(payload['tracking_id']))
+                elif self.path == '/api/star/remove':
+                    self.send(200,tracker.remove(payload['tracking_id']))
                 elif self.path == '/api/mapping':
                     event = validate_mapping(payload)
                     raw_id = engine.ingest('operator', 'mapping', event['event_id'], event)
